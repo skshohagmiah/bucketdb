@@ -17,6 +17,7 @@ go run cmd/bucketdb/main.go \
     -id node-1 \
     -http :8080 \
     -api :9080 \
+    -bootstrap \
     -storage ./data/node1/chunks \
     -metadata ./data/node1/metadata > node1.log 2>&1 &
 NODE1_PID=$!

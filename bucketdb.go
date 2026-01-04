@@ -1,14 +1,17 @@
 package bucketdb
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/skshohagmiah/clusterkit"
@@ -105,16 +108,32 @@ func (db *BucketDB) PutObject(bucket, key string, data []byte, opts *PutObjectOp
 	}
 
 	// If not primary, forward will be handled by HTTP server (implemented separately)
-	// For now, we assume this is called on the correct node or handles its own forwarding
 	if !db.cluster.IsPrimary(partition) {
-		// In a real implementation, we'd forward here if this wasn't purely a library method
-		// But since we're adding an HTTP server, we'll let the server handle routing
 		log.Printf("[BucketDB] Warning: PutObject called on non-primary node for key %s", key)
 	}
 
-	// Check bucket exists
+	// Store locally
+	if err := db.storeObjectLocally(bucket, key, partition.ID, data, opts); err != nil {
+		return err
+	}
+
+	// Replication (Active write-time)
+	replicas := db.cluster.GetReplicas(partition)
+	if len(replicas) > 0 {
+		go db.replicateToNodes(bucket, key, data, opts, replicas)
+	}
+
+	return nil
+}
+
+// storeObjectLocally performs the actual storage on the local node
+func (db *BucketDB) storeObjectLocally(bucket, key, partitionID string, data []byte, opts *PutObjectOptions) error {
+	// Check bucket exists, creates if it doesn't
 	if _, err := db.metadata.GetBucket(bucket); err != nil {
-		return fmt.Errorf("bucket does not exist: %s", bucket)
+		log.Printf("[BucketDB] Auto-creating bucket: %s", bucket)
+		if err := db.metadata.CreateBucket(bucket, "system"); err != nil {
+			return fmt.Errorf("failed to auto-create bucket: %w", err)
+		}
 	}
 
 	// Generate object ID
@@ -155,7 +174,7 @@ func (db *BucketDB) PutObject(bucket, key string, data []byte, opts *PutObjectOp
 		ObjectID:    objectID,
 		Bucket:      bucket,
 		Key:         key,
-		PartitionID: partition.ID,
+		PartitionID: partitionID,
 		Size:        int64(len(data)),
 		ContentType: contentType,
 		Checksum:    overallChecksum,
@@ -183,6 +202,55 @@ func (db *BucketDB) PutObject(bucket, key string, data []byte, opts *PutObjectOp
 	}
 
 	return nil
+}
+
+// replicateToNodes pushes the object to replica nodes
+func (db *BucketDB) replicateToNodes(bucket, key string, data []byte, opts *PutObjectOptions, nodes []clusterkit.Node) {
+	for _, node := range nodes {
+		// Optimization: don't replicate to self (shouldn't happen with CK logic but good to be safe)
+		if node.ID == db.config.Cluster.NodeID {
+			continue
+		}
+
+		apiAddr := node.Services["api"]
+		if apiAddr == "" {
+			continue
+		}
+
+		host := "localhost"
+		if strings.Contains(node.IP, ":") {
+			h, _, err := net.SplitHostPort(node.IP)
+			if err == nil && h != "" {
+				host = h
+			}
+		} else if node.IP != "" {
+			host = node.IP
+		}
+
+		target := host + apiAddr
+		url := fmt.Sprintf("http://%s/internal/replicate/%s/%s", target, bucket, key)
+
+		req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
+		if opts != nil && opts.ContentType != "" {
+			req.Header.Set("Content-Type", opts.ContentType)
+		}
+		// Pass metadata via headers or internal protocol. For now, simple headers.
+		if opts != nil && opts.Metadata != nil {
+			metaJSON, _ := json.Marshal(opts.Metadata)
+			req.Header.Set("X-BucketDB-Meta", string(metaJSON))
+		}
+
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			log.Printf("[BucketDB] ❌ Replication failed to %s: %v", node.ID, err)
+			continue
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+			log.Printf("[BucketDB] ❌ Replication failed to %s: status %d", node.ID, resp.StatusCode)
+		}
+	}
 }
 
 // GetObject retrieves an object
@@ -467,7 +535,22 @@ func (db *BucketDB) syncPartitionData(partitionID string, sources []*clusterkit.
 		log.Printf("[BucketDB] 📥 Syncing partition %s from node %s", partitionID, source.ID)
 
 		// 1. Fetch object list
-		url := fmt.Sprintf("http://%s/internal/partition/%s", source.IP, partitionID)
+		apiAddr := source.Services["api"]
+		if apiAddr == "" {
+			log.Printf("[BucketDB] ⚠️ No API service for source node %s, skipping", source.ID)
+			continue
+		}
+
+		host := "localhost"
+		if strings.Contains(source.IP, ":") {
+			h, _, err := net.SplitHostPort(source.IP)
+			if err == nil && h != "" {
+				host = h
+			}
+		}
+		target := host + apiAddr
+
+		url := fmt.Sprintf("http://%s/internal/partition/%s", target, partitionID)
 		resp, err := http.Get(url)
 		if err != nil {
 			continue
@@ -492,7 +575,7 @@ func (db *BucketDB) syncPartitionData(partitionID string, sources []*clusterkit.
 					continue
 				}
 
-				chunkURL := fmt.Sprintf("http://%s/internal/chunk/%s", source.IP, chunkID)
+				chunkURL := fmt.Sprintf("http://%s/internal/chunk/%s", target, chunkID)
 				cResp, err := http.Get(chunkURL)
 				if err != nil {
 					log.Printf("[BucketDB]     ❌ Failed to fetch chunk %s: %v", chunkID, err)

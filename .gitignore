@@ -28,4 +28,4 @@ storage/
 *.swo
 
 # Project Binaries
-bucketdb
+/bucketdb

@@ -15,6 +15,7 @@ func main() {
 	httpAddr := flag.String("http", ":8080", "ClusterKit HTTP coordination address")
 	apiPort := flag.String("api", ":9080", "BucketDB HTTP API port")
 	joinAddr := flag.String("join", "", "Address of a node to join")
+	bootstrap := flag.Bool("bootstrap", false, "Bootstrap as the first node")
 	storagePath := flag.String("storage", "./data/chunks", "Path for chunk storage")
 	metadataPath := flag.String("metadata", "./data/metadata", "Path for metadata (BadgerDB)")
 
@@ -31,9 +32,13 @@ func main() {
 	config.Cluster.NodeID = *nodeID
 	config.Cluster.HTTPAddr = *httpAddr
 	config.Cluster.JoinAddr = *joinAddr
+	config.Cluster.Bootstrap = *bootstrap
 	config.Cluster.DataDir = *metadataPath + "/cluster"
 	config.Cluster.HealthCheck.Enabled = true
 	config.Cluster.HealthCheck.Interval = 5 * time.Second
+	config.Cluster.Services = map[string]string{
+		"api": *apiPort,
+	}
 
 	// Create and start BucketDB
 	db, err := bucketdb.NewBucketDB(config)

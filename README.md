@@ -54,6 +54,7 @@ graph TD
 
 ### 🛠️ Developer Experience
 *   **Universal API**: Use it as a library in your Go code or as a standalone cluster with a REST API.
+*   **Web Dashboard**: Each node serves a built-in, premium Web UI for monitoring and uploads.
 *   **Intelligent MIME**: Automatic Content-Type detection using magic numbers (first 512 bytes) and fallback extensions.
 *   **Range Requests**: Fully supports HTTP-style range requests (`GetObjectOptions`) to fetch specific segments of massive files.
 
@@ -81,6 +82,14 @@ go mod tidy
 *   **Node 1**: Coordination `:8080` | Public API `:9080`
 *   **Node 2**: Coordination `:8081` | Public API `:9081`
 *   **Node 3**: Coordination `:8082` | Public API `:9082`
+
+### 🖥️ Built-in Web Dashboard
+Every BucketDB node comes with a premium, zero-config management dashboard. Access any node via your browser to manage the cluster visually.
+
+-   **Dashboard URL**: `http://localhost:9080` (or the configured API port)
+-   **Live Monitoring**: Real-time view of the cluster coordination matrix and heartbeats.
+-   **Asset Upload**: Drag-and-drop file uploader with automatic chunking and distribution.
+-   **Object Browser**: View the latest 10 objects in your buckets with live partition tracking.
 
 ---
 
