@@ -1,4 +1,4 @@
-package bucketdb
+package storage
 
 import (
 	"encoding/json"
@@ -8,6 +8,7 @@ import (
 
 	"github.com/dgraph-io/badger/v4"
 	"github.com/dgraph-io/badger/v4/options"
+	"github.com/skshohagmiah/bucketdb/pkg/types"
 )
 
 // MetadataStore handles all metadata operations using BadgerDB
@@ -56,7 +57,7 @@ func (m *MetadataStore) Close() error {
 
 // CreateBucket creates a new bucket
 func (m *MetadataStore) CreateBucket(name, owner string) error {
-	bucket := &Bucket{
+	bucket := &types.Bucket{
 		Name:      name,
 		CreatedAt: time.Now(),
 		Owner:     owner,
@@ -81,8 +82,8 @@ func (m *MetadataStore) CreateBucket(name, owner string) error {
 }
 
 // GetBucket retrieves bucket information
-func (m *MetadataStore) GetBucket(name string) (*Bucket, error) {
-	var bucket Bucket
+func (m *MetadataStore) GetBucket(name string) (*types.Bucket, error) {
+	var bucket types.Bucket
 	key := fmt.Sprintf("bucket:%s", name)
 
 	err := m.db.View(func(txn *badger.Txn) error {
@@ -123,8 +124,8 @@ func (m *MetadataStore) DeleteBucket(name string) error {
 }
 
 // ListBuckets lists all buckets
-func (m *MetadataStore) ListBuckets() ([]*Bucket, error) {
-	var buckets []*Bucket
+func (m *MetadataStore) ListBuckets() ([]*types.Bucket, error) {
+	var buckets []*types.Bucket
 	prefix := "bucket:"
 
 	err := m.db.View(func(txn *badger.Txn) error {
@@ -138,7 +139,7 @@ func (m *MetadataStore) ListBuckets() ([]*Bucket, error) {
 			item := it.Item()
 
 			err := item.Value(func(val []byte) error {
-				var bucket Bucket
+				var bucket types.Bucket
 				if err := json.Unmarshal(val, &bucket); err != nil {
 					return err
 				}
@@ -160,7 +161,7 @@ func (m *MetadataStore) ListBuckets() ([]*Bucket, error) {
 // ===== OBJECT OPERATIONS =====
 
 // SaveObject saves object metadata
-func (m *MetadataStore) SaveObject(obj *Object) error {
+func (m *MetadataStore) SaveObject(obj *types.Object) error {
 	obj.UpdatedAt = time.Now()
 	if obj.CreatedAt.IsZero() {
 		obj.CreatedAt = time.Now()
@@ -180,8 +181,8 @@ func (m *MetadataStore) SaveObject(obj *Object) error {
 }
 
 // GetObject retrieves object metadata
-func (m *MetadataStore) GetObject(bucket, key string) (*Object, error) {
-	var obj Object
+func (m *MetadataStore) GetObject(bucket, key string) (*types.Object, error) {
+	var obj types.Object
 	objKey := fmt.Sprintf("object:%s:%s", bucket, key)
 
 	err := m.db.View(func(txn *badger.Txn) error {
@@ -212,12 +213,12 @@ func (m *MetadataStore) DeleteObject(bucket, key string) error {
 }
 
 // ListObjects lists objects in a bucket with optional prefix
-func (m *MetadataStore) ListObjects(bucket, prefix string, maxKeys int) (*ListObjectsResult, error) {
+func (m *MetadataStore) ListObjects(bucket, prefix string, maxKeys int) (*types.ListObjectsResult, error) {
 	if maxKeys == 0 {
 		maxKeys = 1000 // Default max
 	}
 
-	var objects []*Object
+	var objects []*types.Object
 	searchPrefix := fmt.Sprintf("object:%s:%s", bucket, prefix)
 
 	err := m.db.View(func(txn *badger.Txn) error {
@@ -232,7 +233,7 @@ func (m *MetadataStore) ListObjects(bucket, prefix string, maxKeys int) (*ListOb
 			item := it.Item()
 
 			err := item.Value(func(val []byte) error {
-				var obj Object
+				var obj types.Object
 				if err := json.Unmarshal(val, &obj); err != nil {
 					return err
 				}
@@ -250,7 +251,7 @@ func (m *MetadataStore) ListObjects(bucket, prefix string, maxKeys int) (*ListOb
 		return nil
 	})
 
-	result := &ListObjectsResult{
+	result := &types.ListObjectsResult{
 		Objects:     objects,
 		Prefix:      prefix,
 		TotalCount:  len(objects),
@@ -263,7 +264,7 @@ func (m *MetadataStore) ListObjects(bucket, prefix string, maxKeys int) (*ListOb
 // ===== CHUNK OPERATIONS =====
 
 // SaveChunk saves chunk metadata
-func (m *MetadataStore) SaveChunk(chunk *Chunk) error {
+func (m *MetadataStore) SaveChunk(chunk *types.Chunk) error {
 	if chunk.CreatedAt.IsZero() {
 		chunk.CreatedAt = time.Now()
 	}
@@ -281,8 +282,8 @@ func (m *MetadataStore) SaveChunk(chunk *Chunk) error {
 }
 
 // GetChunk retrieves chunk metadata
-func (m *MetadataStore) GetChunk(chunkID string) (*Chunk, error) {
-	var chunk Chunk
+func (m *MetadataStore) GetChunk(chunkID string) (*types.Chunk, error) {
+	var chunk types.Chunk
 	key := fmt.Sprintf("chunk:%s", chunkID)
 
 	err := m.db.View(func(txn *badger.Txn) error {
@@ -313,8 +314,8 @@ func (m *MetadataStore) DeleteChunk(chunkID string) error {
 }
 
 // GetChunksForObject retrieves all chunks for an object
-func (m *MetadataStore) GetChunksForObject(objectID string) ([]*Chunk, error) {
-	var chunks []*Chunk
+func (m *MetadataStore) GetChunksForObject(objectID string) ([]*types.Chunk, error) {
+	var chunks []*types.Chunk
 	prefix := "chunk:"
 
 	err := m.db.View(func(txn *badger.Txn) error {
@@ -328,7 +329,7 @@ func (m *MetadataStore) GetChunksForObject(objectID string) ([]*Chunk, error) {
 			item := it.Item()
 
 			err := item.Value(func(val []byte) error {
-				var chunk Chunk
+				var chunk types.Chunk
 				if err := json.Unmarshal(val, &chunk); err != nil {
 					return err
 				}
@@ -355,8 +356,8 @@ func (m *MetadataStore) GetChunksForObject(objectID string) ([]*Chunk, error) {
 // ===== STATISTICS =====
 
 // GetStats retrieves storage statistics
-func (m *MetadataStore) GetStats() (*StorageStats, error) {
-	stats := &StorageStats{}
+func (m *MetadataStore) GetStats() (*types.StorageStats, error) {
+	stats := &types.StorageStats{}
 
 	err := m.db.View(func(txn *badger.Txn) error {
 		opts := badger.DefaultIteratorOptions
@@ -374,7 +375,7 @@ func (m *MetadataStore) GetStats() (*StorageStats, error) {
 
 				// Get object size
 				err := item.Value(func(val []byte) error {
-					var obj Object
+					var obj types.Object
 					if err := json.Unmarshal(val, &obj); err != nil {
 						return err
 					}
@@ -402,8 +403,8 @@ func (m *MetadataStore) GetStats() (*StorageStats, error) {
 // ===== UTILITY =====
 
 // GetObjectsInPartition retrieves all objects assigned to a partition
-func (m *MetadataStore) GetObjectsInPartition(partitionID string) ([]*Object, error) {
-	var objects []*Object
+func (m *MetadataStore) GetObjectsInPartition(partitionID string) ([]*types.Object, error) {
+	var objects []*types.Object
 	prefix := "object:"
 
 	err := m.db.View(func(txn *badger.Txn) error {
@@ -417,7 +418,7 @@ func (m *MetadataStore) GetObjectsInPartition(partitionID string) ([]*Object, er
 			}
 
 			err := item.Value(func(val []byte) error {
-				var obj Object
+				var obj types.Object
 				if err := json.Unmarshal(val, &obj); err != nil {
 					return err
 				}

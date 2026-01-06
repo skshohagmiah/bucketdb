@@ -5,12 +5,13 @@ import (
 	"log"
 	"os"
 
-	"github.com/skshohagmiah/bucketdb"
+	"github.com/skshohagmiah/bucketdb/pkg/core"
+	"github.com/skshohagmiah/bucketdb/pkg/types"
 )
 
 func main() {
 	// Create a simple configuration for a single local node
-	config := bucketdb.DefaultConfig()
+	config := types.DefaultConfig()
 	config.StoragePath = "./example_storage/chunks"
 	config.MetadataPath = "./example_storage/metadata"
 	config.Cluster.NodeID = "example-node"
@@ -21,7 +22,7 @@ func main() {
 	os.MkdirAll(config.MetadataPath, 0755)
 
 	// Initialize BucketDB
-	db, err := bucketdb.NewBucketDB(config)
+	db, err := core.NewBucketDB(config)
 	if err != nil {
 		log.Fatalf("Failed to initialize BucketDB: %v", err)
 	}
@@ -36,7 +37,7 @@ func main() {
 	// 2. Put an object
 	fmt.Println("📤 Uploading object: 'hello.txt'...")
 	data := []byte("Hello, BucketDB! This is a simple example.")
-	opts := &bucketdb.PutObjectOptions{
+	opts := &types.PutObjectOptions{
 		ContentType: "text/plain",
 		Metadata: map[string]string{
 			"version": "1.0",

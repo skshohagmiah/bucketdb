@@ -1,4 +1,4 @@
-package bucketdb
+package core
 
 import (
 	"bytes"
@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/skshohagmiah/bucketdb/pkg/types"
 )
 
 // setupTestDB helper to create a temporary DB instance for testing
@@ -16,7 +18,7 @@ func setupTestDB(t *testing.T) (*BucketDB, func()) {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 
-	config := DefaultConfig()
+	config := types.DefaultConfig()
 	config.StoragePath = filepath.Join(tmpDir, "chunks")
 	config.MetadataPath = filepath.Join(tmpDir, "metadata")
 	config.Cluster.NodeID = "test-node"
@@ -39,7 +41,7 @@ func setupTestDB(t *testing.T) (*BucketDB, func()) {
 	ready := false
 	for i := 0; i < 100; i++ {
 		// Try to resolve a partition
-		_, err := db.cluster.GetPartition("ping")
+		_, err := db.Cluster.GetPartition("ping")
 		if err == nil {
 			ready = true
 			break
@@ -109,7 +111,7 @@ func TestObjectOperations(t *testing.T) {
 	// Test case 1: Small object (single chunk)
 	key := "small-file.txt"
 	content := []byte("Hello BucketDB")
-	opts := &PutObjectOptions{ContentType: "text/plain"}
+	opts := &types.PutObjectOptions{ContentType: "text/plain"}
 
 	if err := db.PutObject(bucketName, key, content, opts); err != nil {
 		t.Fatalf("Failed to put small object: %v", err)
@@ -127,7 +129,7 @@ func TestObjectOperations(t *testing.T) {
 
 	// Test case 2: Larger object (multiple chunks)
 	// Force small chunk size for testing without massive files
-	db.config.ChunkSize = 1024 // 1KB chunks
+	db.Config.ChunkSize = 1024 // 1KB chunks
 
 	largeContent := make([]byte, 5000) // Should be ~5 chunks
 	for i := range largeContent {
@@ -172,7 +174,7 @@ func TestRangeRequest(t *testing.T) {
 	}
 
 	// Range: First 5 bytes
-	opts := &GetObjectOptions{RangeStart: 0, RangeEnd: 5}
+	opts := &types.GetObjectOptions{RangeStart: 0, RangeEnd: 5}
 	part, err := db.GetObject(bucketName, "digits", opts)
 	if err != nil {
 		t.Fatalf("Range request failed: %v", err)
@@ -182,7 +184,7 @@ func TestRangeRequest(t *testing.T) {
 	}
 
 	// Range: Middle
-	opts = &GetObjectOptions{RangeStart: 3, RangeEnd: 7}
+	opts = &types.GetObjectOptions{RangeStart: 3, RangeEnd: 7}
 	part, err = db.GetObject(bucketName, "digits", opts)
 	if err != nil {
 		t.Fatalf("Range request failed: %v", err)

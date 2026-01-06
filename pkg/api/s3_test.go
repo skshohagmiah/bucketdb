@@ -1,4 +1,4 @@
-package bucketdb
+package api
 
 import (
 	"bytes"
@@ -6,20 +6,23 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+
+	"github.com/skshohagmiah/bucketdb/pkg/core"
+	"github.com/skshohagmiah/bucketdb/pkg/types"
 )
 
-func setupTestS3Server(t *testing.T) (*BucketDB, *Server, func()) {
+func setupTestS3Server(t *testing.T) (*core.BucketDB, *Server, func()) {
 	// Setup Temp Dirs
 	tmpMetadata, _ := os.MkdirTemp("", "s3_meta_*")
 	tmpData, _ := os.MkdirTemp("", "s3_data_*")
 
-	config := DefaultConfig()
+	config := types.DefaultConfig()
 	config.MetadataPath = tmpMetadata
 	config.StoragePath = tmpData
 	config.Standalone = true
 	config.Cluster.NodeID = "test-node"
 
-	db, err := NewBucketDB(config)
+	db, err := core.NewBucketDB(config)
 	if err != nil {
 		t.Fatalf("Failed to init DB: %v", err)
 	}
@@ -83,7 +86,7 @@ func TestS3BucketLifecycle(t *testing.T) {
 	}
 
 	// Verify internal state
-	_, err := db.metadata.GetBucket("new-bucket")
+	_, err := db.Metadata.GetBucket("new-bucket")
 	if err != nil {
 		t.Errorf("Bucket was not created internally")
 	}

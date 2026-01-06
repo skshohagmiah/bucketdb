@@ -1,4 +1,4 @@
-package bucketdb
+package storage
 
 import (
 	"crypto/sha256"

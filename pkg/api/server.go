@@ -1,27 +1,55 @@
-package bucketdb
+package api
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/skshohagmiah/bucketdb/pkg/core"
+	"github.com/skshohagmiah/bucketdb/pkg/metrics"
+	"github.com/skshohagmiah/bucketdb/pkg/types"
 )
 
 // Server is the HTTP server for BucketDB
 type Server struct {
-	db   *BucketDB
-	port string
+	db     *core.BucketDB
+	port   string
+	client *http.Client
 }
 
 // NewServer creates a new HTTP server
-func NewServer(db *BucketDB, port string) *Server {
+func NewServer(db *core.BucketDB, port string) *Server {
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: db.Config.TLS.InsecureSkipVerify,
+		},
+	}
+
+	if db.Config.TLS.Enabled && db.Config.TLS.CAFile != "" {
+		caCert, err := os.ReadFile(db.Config.TLS.CAFile)
+		if err == nil {
+			caCertPool := x509.NewCertPool()
+			caCertPool.AppendCertsFromPEM(caCert)
+			tr.TLSClientConfig.RootCAs = caCertPool
+		} else {
+			slog.Error("Failed to read CA file", "error", err)
+		}
+	}
+
 	return &Server{
-		db:   db,
-		port: port,
+		db:     db,
+		port:   port,
+		client: &http.Client{Transport: tr},
 	}
 }
 
@@ -30,20 +58,27 @@ func (s *Server) Start() error {
 	mux := http.NewServeMux()
 
 	// Public API & UI
-	mux.HandleFunc("/", s.handleRoot)
-	mux.HandleFunc("/objects", s.handleListObjects)
-	mux.HandleFunc("/objects/", s.handleObject)
-	mux.HandleFunc("/buckets", s.handleBuckets)
+	mux.Handle("/", s.instrumentedHandler(s.handleRoot, "/"))
+	mux.Handle("/objects", s.instrumentedHandler(s.handleListObjects, "/objects"))
+	mux.Handle("/objects/", s.instrumentedHandler(s.handleObject, "/objects/:bucket/:key"))
+	mux.Handle("/buckets", s.instrumentedHandler(s.handleBuckets, "/buckets"))
 
 	// Cluster Information
-	mux.HandleFunc("/cluster", s.handleCluster)
+	mux.Handle("/cluster", s.instrumentedHandler(s.handleCluster, "/cluster"))
 
 	// Internal API (for replication and migration)
-	mux.HandleFunc("/internal/chunk/", s.handleInternalChunk)
-	mux.HandleFunc("/internal/partition/", s.handleInternalPartition)
-	mux.HandleFunc("/internal/replicate/", s.handleInternalReplicate)
+	mux.Handle("/internal/chunk/", s.instrumentedHandler(s.handleInternalChunk, "/internal/chunk/:id"))
+	mux.Handle("/internal/partition/", s.instrumentedHandler(s.handleInternalPartition, "/internal/partition/:id"))
+	mux.Handle("/internal/replicate/", s.instrumentedHandler(s.handleInternalReplicate, "/internal/replicate/:bucket/:key"))
 
-	log.Printf("[Server] HTTP server starting on %s", s.port)
+	// Observability
+	mux.Handle("/metrics", promhttp.Handler())
+
+	slog.Info("Server starting", "port", s.port, "tls", s.db.Config.TLS.Enabled)
+
+	if s.db.Config.TLS.Enabled {
+		return http.ListenAndServeTLS(s.port, s.db.Config.TLS.CertFile, s.db.Config.TLS.KeyFile, mux)
+	}
 	return http.ListenAndServe(s.port, mux)
 }
 
@@ -59,16 +94,16 @@ func (s *Server) handleObject(w http.ResponseWriter, r *http.Request) {
 	key := string(bytes.Join(parts[1:], []byte("/")))
 
 	// Determine partition and primary node
-	partition, err := s.db.cluster.GetPartition(key)
+	partition, err := s.db.Cluster.GetPartition(key)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	if !s.db.cluster.IsPrimary(partition) && !s.db.cluster.IsReplica(partition) {
+	if !s.db.Cluster.IsPrimary(partition) && !s.db.Cluster.IsReplica(partition) {
 		// Forward to primary
-		primary := s.db.cluster.GetPrimary(partition)
-		log.Printf("[Server] Forwarding %s request for %s/%s to node %s (%s)", r.Method, bucket, key, primary.ID, primary.IP)
+		primary := s.db.Cluster.GetPrimary(partition)
+		slog.Debug("Forwarding request", "method", r.Method, "bucket", bucket, "key", key, "primary", primary.ID)
 
 		resp, err := s.ForwardRequest(primary.IP, r)
 		if err != nil {
@@ -110,7 +145,7 @@ func (s *Server) handleObject(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		opts := &PutObjectOptions{
+		opts := &types.PutObjectOptions{
 			ContentType: r.Header.Get("Content-Type"),
 			Metadata:    make(map[string]string),
 		}
@@ -184,7 +219,7 @@ func (s *Server) handleBuckets(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCluster(w http.ResponseWriter, r *http.Request) {
 	// Get cluster info from ClusterKit
-	info := s.db.cluster.GetCluster()
+	info := s.db.Cluster.GetCluster()
 	json.NewEncoder(w).Encode(info)
 }
 
@@ -210,7 +245,11 @@ func (s *Server) handleInternalPartition(w http.ResponseWriter, r *http.Request)
 
 // ForwardRequest forwards a request to another node
 func (s *Server) ForwardRequest(nodeAddr string, r *http.Request) (*http.Response, error) {
-	url := fmt.Sprintf("http://%s%s", nodeAddr, r.URL.Path)
+	protocol := "http"
+	if s.db.Config.TLS.Enabled {
+		protocol = "https"
+	}
+	url := fmt.Sprintf("%s://%s%s", protocol, nodeAddr, r.URL.Path)
 
 	var bodyReader io.Reader
 	if r.Body != nil {
@@ -221,8 +260,7 @@ func (s *Server) ForwardRequest(nodeAddr string, r *http.Request) (*http.Respons
 	req, _ := http.NewRequest(r.Method, url, bodyReader)
 	req.Header = r.Header
 
-	client := &http.Client{}
-	return client.Do(req)
+	return s.client.Do(req)
 }
 
 // handleInternalReplicate handles incoming replication requests from other nodes
@@ -247,7 +285,7 @@ func (s *Server) handleInternalReplicate(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	opts := &PutObjectOptions{
+	opts := &types.PutObjectOptions{
 		ContentType: r.Header.Get("Content-Type"),
 		Metadata:    make(map[string]string),
 	}
@@ -258,13 +296,13 @@ func (s *Server) handleInternalReplicate(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Store locally using internal storage logic (same package, so we can access storeObjectLocally)
-	partition, err := s.db.cluster.GetPartition(key)
+	partition, err := s.db.Cluster.GetPartition(key)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	err = s.db.storeObjectLocally(bucket, key, partition.ID, data, opts)
+	err = s.db.StoreObjectLocally(bucket, key, partition.ID, data, opts)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -286,6 +324,34 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	// 2. Delegate everything else to S3 Gateway
 	// This captures /bucket/key requests which match the "/" catch-all pattern
 	s.handleS3Request(w, r)
+}
+
+// instrumentedHandler wraps a handler with Prometheus metrics
+func (s *Server) instrumentedHandler(handler http.HandlerFunc, path string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+
+		// Use a response writer that captures the status code
+		wrapped := &responseWriter{ResponseWriter: w, status: http.StatusOK}
+
+		handler.ServeHTTP(wrapped, r)
+
+		duration := time.Since(start).Seconds()
+		statusStr := fmt.Sprintf("%d", wrapped.status)
+
+		metrics.HttpRequestsTotal.WithLabelValues(r.Method, path, statusStr).Inc()
+		metrics.HttpRequestDuration.WithLabelValues(r.Method, path).Observe(duration)
+	})
+}
+
+type responseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
 }
 
 const uiHTML = `

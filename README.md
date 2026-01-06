@@ -1,38 +1,8 @@
 # BucketDB
 
-**Distributed Object Storage Engine.** High-performance, self-hosted, S3-like scalability.
+**Distributed Object Storage Engine.** High-performance, self-hosted, S3-Compatible System and similar scalability.
 
 ---
-
-## 🏗️ Architecture
-
-Masterless, Raft-based coordination.
-
-```mermaid
-graph TD
-    Client[Client Application] -->|HTTP/REST| API[Public API Gateway]
-    API -->|Route| Coordinator[BucketDB Coordinator]
-    
-    subgraph "Control Plane (ClusterKit)"
-        Coordinator --> CK[Consistent Hashing Engine]
-        CK --> Partitions[64 Virtual Partitions]
-        Partitions --> Election[Raft Leader Election]
-        Partitions --> Rebalance[Auto-Migration Hook]
-    end
-    
-    subgraph "Data Plane (Storage Engine)"
-        Coordinator --> MetadataStore[BadgerDB Metadata]
-        Coordinator --> ChunkStore[Filesystem Shards]
-        
-        MetadataStore --> Index["Object & Bucket Indexes"]
-        ChunkStore --> Blobs["Immutable Data Chunks"]
-    end
-    
-    subgraph "Distributed Features"
-        Coordinator --> Proxy[Request Forwarder]
-        Coordinator --> Sync[Peer-to-Peer Sync]
-    end
-```
 
 ## ✨ Features
 
@@ -42,8 +12,6 @@ graph TD
 - **Safe**: End-to-end SHA256 integrity checks.
 - **S3 Compatible**: Basic S3 Gateway for standard clients (e.g., `aws s3`, `boto3`).
 - **Developer Ready**: Universal REST API, Web Dashboard, Range Requests.
-
----
 
 ---
 
@@ -65,7 +33,7 @@ docker run -d -p 9080:9080 -p 8080:8080 skshohagmiah/bucketdb -bootstrap=true
 ### Local Dev
 ```bash
 go get github.com/skshohagmiah/bucketdb
-./run_cluster.sh
+scripts/run_cluster.sh
 ```
 
 ### 🖥️ Dashboard
@@ -127,8 +95,13 @@ requests.get("http://localhost:9080/objects/bucket/file")
 ## 🧩 Embedded (Go)
 
 ```go
-config := bucketdb.DefaultConfig()
-db, _ := bucketdb.NewBucketDB(config)
+import (
+    "github.com/skshohagmiah/bucketdb/pkg/core"
+    "github.com/skshohagmiah/bucketdb/pkg/types"
+)
+
+config := types.DefaultConfig()
+db, _ := core.NewBucketDB(config)
 defer db.Close()
 
 db.CreateBucket("assets", "admin")

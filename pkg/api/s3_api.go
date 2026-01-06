@@ -1,4 +1,4 @@
-package bucketdb
+package api
 
 import (
 	"encoding/xml"

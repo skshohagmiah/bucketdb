@@ -1,4 +1,4 @@
-package bucketdb
+package api
 
 import (
 	"fmt"
@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/skshohagmiah/bucketdb/pkg/types"
 )
 
 // handleS3Request routes S3-style requests to BucketDB operations
@@ -112,15 +114,15 @@ func (s *Server) handleS3BucketOps(w http.ResponseWriter, r *http.Request, bucke
 func (s *Server) handleS3Object(w http.ResponseWriter, r *http.Request, bucket, key string) {
 	// 1. Cluster Coordination (Forwarding)
 	// We need to route based on Object Key
-	if !s.db.config.Standalone {
-		partition, err := s.db.cluster.GetPartition(key)
+	if !s.db.Config.Standalone {
+		partition, err := s.db.Cluster.GetPartition(key)
 		if err != nil {
 			s3Error(w, "InternalError", err.Error(), key, http.StatusInternalServerError)
 			return
 		}
 
-		if !s.db.cluster.IsPrimary(partition) && !s.db.cluster.IsReplica(partition) {
-			primary := s.db.cluster.GetPrimary(partition)
+		if !s.db.Cluster.IsPrimary(partition) && !s.db.Cluster.IsReplica(partition) {
+			primary := s.db.Cluster.GetPrimary(partition)
 			// Forwarding
 			resp, err := s.ForwardRequest(primary.IP, r)
 			if err != nil {
@@ -151,7 +153,7 @@ func (s *Server) handleS3Object(w http.ResponseWriter, r *http.Request, bucket, 
 			return
 		}
 
-		opts := &PutObjectOptions{
+		opts := &types.PutObjectOptions{
 			ContentType: r.Header.Get("Content-Type"),
 			// S3 Metadata headers could be parsed here
 		}
@@ -167,14 +169,14 @@ func (s *Server) handleS3Object(w http.ResponseWriter, r *http.Request, bucket, 
 	case http.MethodGet:
 		// Map to GetObject
 		// Parse Range header if present
-		var opts *GetObjectOptions
+		var opts *types.GetObjectOptions
 		rangeHeader := r.Header.Get("Range")
 		if rangeHeader != "" {
 			// Basic parsing: bytes=0-1024
 			var start, end int64
 			fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end)
 			if end > 0 {
-				opts = &GetObjectOptions{RangeStart: start, RangeEnd: end + 1}
+				opts = &types.GetObjectOptions{RangeStart: start, RangeEnd: end + 1}
 			}
 		}
 

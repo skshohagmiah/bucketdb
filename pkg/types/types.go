@@ -1,4 +1,4 @@
-package bucketdb
+package types
 
 import (
 	"time"
@@ -48,6 +48,15 @@ type ListObjectsResult struct {
 	TotalCount  int       `json:"total_count"`
 }
 
+// TLSConfig holds configuration for encrypted communication
+type TLSConfig struct {
+	Enabled            bool
+	CertFile           string
+	KeyFile            string
+	CAFile             string // For internal trust
+	InsecureSkipVerify bool   // For dev mode
+}
+
 // StorageStats represents storage statistics
 type StorageStats struct {
 	TotalObjects    int64   `json:"total_objects"`
@@ -70,6 +79,9 @@ type Config struct {
 	// Cluster configuration
 	Cluster clusterkit.Options
 
+	// TLS configuration
+	TLS TLSConfig
+
 	// Standalone mode (single node, no cluster coordination)
 	Standalone bool
 }
@@ -85,6 +97,9 @@ func DefaultConfig() *Config {
 		Cluster: clusterkit.Options{
 			NodeID:   "node-1",
 			HTTPAddr: ":8080",
+		},
+		TLS: TLSConfig{
+			Enabled: false,
 		},
 	}
 }

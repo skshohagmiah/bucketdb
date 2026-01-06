@@ -16,7 +16,8 @@
 
 # BucketDB Data
 data/
-storage/
+/storage/
+!pkg/storage/
 clusterkit-data/
 
 # Logs
@@ -30,3 +31,4 @@ clusterkit-data/
 
 # Project Binaries
 /bucketdb
+logs/

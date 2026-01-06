@@ -1,4 +1,4 @@
-package bucketdb
+package core
 
 import (
 	"bytes"
@@ -7,38 +7,46 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"sort"
 	"strings"
 	"time"
 
+	"crypto/tls"
+	"crypto/x509"
+	"os"
+
+	"github.com/skshohagmiah/bucketdb/pkg/metrics"
+	"github.com/skshohagmiah/bucketdb/pkg/storage"
+	"github.com/skshohagmiah/bucketdb/pkg/types"
 	"github.com/skshohagmiah/clusterkit"
 )
 
 // BucketDB is the main coordinator for the object storage system
 type BucketDB struct {
-	config       *Config
-	metadata     *MetadataStore
-	chunkStorage *ChunkStorage
-	cluster      *clusterkit.ClusterKit
+	Config       *types.Config
+	Metadata     *storage.MetadataStore
+	ChunkStorage *storage.ChunkStorage
+	Cluster      *clusterkit.ClusterKit
+	client       *http.Client
 }
 
 // NewBucketDB creates a new object storage system
-func NewBucketDB(config *Config) (*BucketDB, error) {
+func NewBucketDB(config *types.Config) (*BucketDB, error) {
 	if config == nil {
-		config = DefaultConfig()
+		config = types.DefaultConfig()
 	}
 
 	// Initialize metadata store (BadgerDB)
-	metadata, err := NewMetadataStore(config.MetadataPath, config.CompressionType)
+	metadata, err := storage.NewMetadataStore(config.MetadataPath, config.CompressionType)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize metadata store: %w", err)
 	}
 
 	// Initialize chunk storage (filesystem)
-	chunkStorage, err := NewChunkStorage(config.StoragePath)
+	chunkStorage, err := storage.NewChunkStorage(config.StoragePath)
 	if err != nil {
 		metadata.Close()
 		return nil, fmt.Errorf("failed to initialize chunk storage: %w", err)
@@ -51,11 +59,30 @@ func NewBucketDB(config *Config) (*BucketDB, error) {
 		return nil, fmt.Errorf("failed to initialize ClusterKit: %w", err)
 	}
 
+	// Configure secure HTTP client for internal communication
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: config.TLS.InsecureSkipVerify,
+		},
+	}
+
+	if config.TLS.Enabled && config.TLS.CAFile != "" {
+		caCert, err := os.ReadFile(config.TLS.CAFile)
+		if err == nil {
+			caCertPool := x509.NewCertPool()
+			caCertPool.AppendCertsFromPEM(caCert)
+			tr.TLSClientConfig.RootCAs = caCertPool
+		} else {
+			slog.Error("Failed to read CA file", "error", err)
+		}
+	}
+
 	db := &BucketDB{
-		config:       config,
-		metadata:     metadata,
-		chunkStorage: chunkStorage,
-		cluster:      ck,
+		Config:       config,
+		Metadata:     metadata,
+		ChunkStorage: chunkStorage,
+		Cluster:      ck,
+		client:       &http.Client{Transport: tr},
 	}
 
 	// Register hooks
@@ -73,14 +100,14 @@ func NewBucketDB(config *Config) (*BucketDB, error) {
 // Close closes the object store
 func (db *BucketDB) Close() error {
 	// Stop cluster coordination first
-	if db.cluster != nil {
-		if err := db.cluster.Stop(); err != nil {
-			log.Printf("[BucketDB] Warning: failed to stop cluster: %v", err)
+	if db.Cluster != nil {
+		if err := db.Cluster.Stop(); err != nil {
+			slog.Warn("Failed to stop cluster", "error", err)
 		}
 	}
 
 	// Close metadata store
-	if err := db.metadata.Close(); err != nil {
+	if err := db.Metadata.Close(); err != nil {
 		return fmt.Errorf("failed to close metadata: %w", err)
 	}
 
@@ -91,26 +118,33 @@ func (db *BucketDB) Close() error {
 
 // CreateBucket creates a new bucket
 func (db *BucketDB) CreateBucket(name, owner string) error {
-	return db.metadata.CreateBucket(name, owner)
+	return db.Metadata.CreateBucket(name, owner)
 }
 
 // DeleteBucket deletes a bucket (must be empty)
 func (db *BucketDB) DeleteBucket(name string) error {
-	return db.metadata.DeleteBucket(name)
+	return db.Metadata.DeleteBucket(name)
 }
 
 // ListBuckets lists all buckets
-func (db *BucketDB) ListBuckets() ([]*Bucket, error) {
-	return db.metadata.ListBuckets()
+func (db *BucketDB) ListBuckets() ([]*types.Bucket, error) {
+	return db.Metadata.ListBuckets()
 }
 
 // ===== OBJECT OPERATIONS =====
 
 // PutObject stores an object
-func (db *BucketDB) PutObject(bucket, key string, data []byte, opts *PutObjectOptions) error {
+func (db *BucketDB) PutObject(bucket, key string, data []byte, opts *types.PutObjectOptions) error {
+	start := time.Now()
+	defer func() {
+		duration := time.Since(start).Seconds()
+		metrics.StorageOperationDuration.WithLabelValues("PutObject").Observe(duration)
+	}()
+
 	// Validate size
-	if int64(len(data)) > db.config.MaxObjectSize {
-		return fmt.Errorf("object too large: %d bytes (max: %d)", len(data), db.config.MaxObjectSize)
+	if int64(len(data)) > db.Config.MaxObjectSize {
+		metrics.StorageOperationsTotal.WithLabelValues("PutObject", bucket, "error_too_large").Inc()
+		return fmt.Errorf("object too large: %d bytes (max: %d)", len(data), db.Config.MaxObjectSize)
 	}
 
 	// Calculate partition
@@ -118,46 +152,48 @@ func (db *BucketDB) PutObject(bucket, key string, data []byte, opts *PutObjectOp
 	var isPrimary bool
 	var partition *clusterkit.Partition
 
-	if db.config.Standalone {
+	if db.Config.Standalone {
 		partitionID = "0"
 		isPrimary = true
 	} else {
-		p, err := db.cluster.GetPartition(key)
+		p, err := db.Cluster.GetPartition(key)
 		if err != nil {
 			return fmt.Errorf("failed to get partition: %w", err)
 		}
 		partition = p
 		partitionID = partition.ID
-		isPrimary = db.cluster.IsPrimary(partition)
+		isPrimary = db.Cluster.IsPrimary(partition)
 	}
 
 	// If not primary, forward will be handled by HTTP server (implemented separately)
 	if !isPrimary {
-		log.Printf("[BucketDB] Warning: PutObject called on non-primary node for key %s", key)
+		slog.Warn("PutObject called on non-primary node", "key", key)
 	}
 
 	// Store locally
-	if err := db.storeObjectLocally(bucket, key, partitionID, data, opts); err != nil {
+	if err := db.StoreObjectLocally(bucket, key, partitionID, data, opts); err != nil {
+		metrics.StorageOperationsTotal.WithLabelValues("PutObject", bucket, "error_store").Inc()
 		return err
 	}
 
 	// Replication (Active write-time)
-	if !db.config.Standalone {
-		replicas := db.cluster.GetReplicas(partition)
+	if !db.Config.Standalone {
+		replicas := db.Cluster.GetReplicas(partition)
 		if len(replicas) > 0 {
 			go db.replicateToNodes(bucket, key, data, opts, replicas)
 		}
 	}
 
+	metrics.StorageOperationsTotal.WithLabelValues("PutObject", bucket, "success").Inc()
 	return nil
 }
 
-// storeObjectLocally performs the actual storage on the local node
-func (db *BucketDB) storeObjectLocally(bucket, key, partitionID string, data []byte, opts *PutObjectOptions) error {
+// StoreObjectLocally performs the actual storage on the local node
+func (db *BucketDB) StoreObjectLocally(bucket, key, partitionID string, data []byte, opts *types.PutObjectOptions) error {
 	// Check bucket exists, creates if it doesn't
-	if _, err := db.metadata.GetBucket(bucket); err != nil {
-		log.Printf("[BucketDB] Auto-creating bucket: %s", bucket)
-		if err := db.metadata.CreateBucket(bucket, "system"); err != nil {
+	if _, err := db.Metadata.GetBucket(bucket); err != nil {
+		slog.Info("Auto-creating bucket", "bucket", bucket)
+		if err := db.Metadata.CreateBucket(bucket, "system"); err != nil {
 			return fmt.Errorf("failed to auto-create bucket: %w", err)
 		}
 	}
@@ -174,12 +210,12 @@ func (db *BucketDB) storeObjectLocally(bucket, key, partitionID string, data []b
 	}
 
 	// Calculate overall checksum
-	overallChecksum := db.chunkStorage.CalculateChecksum(data)
+	overallChecksum := db.ChunkStorage.CalculateChecksum(data)
 
 	// Determine if we need to chunk
 	var chunkIDs []string
 
-	if int64(len(data)) <= db.config.ChunkSize {
+	if int64(len(data)) <= db.Config.ChunkSize {
 		// Small file - single chunk
 		chunkID, err := db.writeSingleChunk(objectID, 0, data)
 		if err != nil {
@@ -196,7 +232,7 @@ func (db *BucketDB) storeObjectLocally(bucket, key, partitionID string, data []b
 	}
 
 	// Create object metadata
-	obj := &Object{
+	obj := &types.Object{
 		ObjectID:    objectID,
 		Bucket:      bucket,
 		Key:         key,
@@ -218,11 +254,11 @@ func (db *BucketDB) storeObjectLocally(bucket, key, partitionID string, data []b
 	}
 
 	// Save object metadata
-	if err := db.metadata.SaveObject(obj); err != nil {
+	if err := db.Metadata.SaveObject(obj); err != nil {
 		// Cleanup chunks on failure
 		for _, chunkID := range chunkIDs {
-			db.chunkStorage.DeleteChunk(chunkID)
-			db.metadata.DeleteChunk(chunkID)
+			db.ChunkStorage.DeleteChunk(chunkID)
+			db.Metadata.DeleteChunk(chunkID)
 		}
 		return fmt.Errorf("failed to save object metadata: %w", err)
 	}
@@ -231,10 +267,10 @@ func (db *BucketDB) storeObjectLocally(bucket, key, partitionID string, data []b
 }
 
 // replicateToNodes pushes the object to replica nodes
-func (db *BucketDB) replicateToNodes(bucket, key string, data []byte, opts *PutObjectOptions, nodes []clusterkit.Node) {
+func (db *BucketDB) replicateToNodes(bucket, key string, data []byte, opts *types.PutObjectOptions, nodes []clusterkit.Node) {
 	for _, node := range nodes {
 		// Optimization: don't replicate to self (shouldn't happen with CK logic but good to be safe)
-		if node.ID == db.config.Cluster.NodeID {
+		if node.ID == db.Config.Cluster.NodeID {
 			continue
 		}
 
@@ -262,7 +298,11 @@ func (db *BucketDB) replicateToNodes(bucket, key string, data []byte, opts *PutO
 		}
 
 		target := host + apiAddr
-		url := fmt.Sprintf("http://%s/internal/replicate/%s/%s", target, bucket, key)
+		protocol := "http"
+		if db.Config.TLS.Enabled {
+			protocol = "https"
+		}
+		url := fmt.Sprintf("%s://%s/internal/replicate/%s/%s", protocol, target, bucket, key)
 
 		req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
 		if opts != nil && opts.ContentType != "" {
@@ -274,32 +314,47 @@ func (db *BucketDB) replicateToNodes(bucket, key string, data []byte, opts *PutO
 			req.Header.Set("X-BucketDB-Meta", string(metaJSON))
 		}
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := db.client.Do(req)
 		if err != nil {
-			log.Printf("[BucketDB] ❌ Replication failed to %s: %v", node.ID, err)
+			slog.Error("Replication failed", "node", node.ID, "error", err)
+			metrics.ReplicationFailuresTotal.Inc()
 			continue
 		}
 		resp.Body.Close()
 
 		if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-			log.Printf("[BucketDB] ❌ Replication failed to %s: status %d", node.ID, resp.StatusCode)
+			slog.Error("Replication failed", "node", node.ID, "status", resp.StatusCode)
+			metrics.ReplicationFailuresTotal.Inc()
 		} else {
-			log.Printf("[BucketDB] ✅ Replicated to %s successfully", node.ID)
+			slog.Info("Replicated successfully", "node", node.ID)
 		}
 	}
 }
 
 // GetObject retrieves an object
-func (db *BucketDB) GetObject(bucket, key string, opts *GetObjectOptions) ([]byte, error) {
+func (db *BucketDB) GetObject(bucket, key string, opts *types.GetObjectOptions) ([]byte, error) {
+	start := time.Now()
+	defer func() {
+		duration := time.Since(start).Seconds()
+		metrics.StorageOperationDuration.WithLabelValues("GetObject").Observe(duration)
+	}()
+
 	// Get object metadata
-	obj, err := db.metadata.GetObject(bucket, key)
+	obj, err := db.Metadata.GetObject(bucket, key)
 	if err != nil {
+		metrics.StorageOperationsTotal.WithLabelValues("GetObject", bucket, "error_not_found").Inc()
 		return nil, err
 	}
 
 	// Handle range requests
 	if opts != nil && (opts.RangeStart > 0 || opts.RangeEnd > 0) {
-		return db.getObjectRange(obj, opts.RangeStart, opts.RangeEnd)
+		data, err := db.getObjectRange(obj, opts.RangeStart, opts.RangeEnd)
+		if err != nil {
+			metrics.StorageOperationsTotal.WithLabelValues("GetObject", bucket, "error_range").Inc()
+		} else {
+			metrics.StorageOperationsTotal.WithLabelValues("GetObject", bucket, "success_range").Inc()
+		}
+		return data, err
 	}
 
 	// Read all chunks
@@ -307,19 +362,19 @@ func (db *BucketDB) GetObject(bucket, key string, opts *GetObjectOptions) ([]byt
 
 	for _, chunkID := range obj.ChunkIDs {
 		// Get chunk metadata
-		chunkMeta, err := db.metadata.GetChunk(chunkID)
+		chunkMeta, err := db.Metadata.GetChunk(chunkID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get chunk metadata: %w", err)
 		}
 
 		// Read chunk data
-		chunkData, err := db.chunkStorage.ReadChunk(chunkID)
+		chunkData, err := db.ChunkStorage.ReadChunk(chunkID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read chunk %s: %w", chunkID, err)
 		}
 
 		// Verify checksum
-		if !db.chunkStorage.VerifyChecksum(chunkData, chunkMeta.Checksum) {
+		if !db.ChunkStorage.VerifyChecksum(chunkData, chunkMeta.Checksum) {
 			return nil, fmt.Errorf("checksum mismatch for chunk %s", chunkID)
 		}
 
@@ -327,22 +382,24 @@ func (db *BucketDB) GetObject(bucket, key string, opts *GetObjectOptions) ([]byt
 	}
 
 	// Verify overall checksum
-	if !db.chunkStorage.VerifyChecksum(result, obj.Checksum) {
+	if !db.ChunkStorage.VerifyChecksum(result, obj.Checksum) {
+		metrics.StorageOperationsTotal.WithLabelValues("GetObject", bucket, "error_checksum").Inc()
 		return nil, fmt.Errorf("overall checksum mismatch for object %s/%s", bucket, key)
 	}
 
+	metrics.StorageOperationsTotal.WithLabelValues("GetObject", bucket, "success").Inc()
 	return result, nil
 }
 
 // GetObjectMetadata retrieves only object metadata (no data)
-func (db *BucketDB) GetObjectMetadata(bucket, key string) (*Object, error) {
-	return db.metadata.GetObject(bucket, key)
+func (db *BucketDB) GetObjectMetadata(bucket, key string) (*types.Object, error) {
+	return db.Metadata.GetObject(bucket, key)
 }
 
 // DeleteObject deletes an object
 func (db *BucketDB) DeleteObject(bucket, key string) error {
 	// Get object metadata
-	obj, err := db.metadata.GetObject(bucket, key)
+	obj, err := db.Metadata.GetObject(bucket, key)
 	if err != nil {
 		return err
 	}
@@ -350,37 +407,37 @@ func (db *BucketDB) DeleteObject(bucket, key string) error {
 	// Delete all chunks
 	for _, chunkID := range obj.ChunkIDs {
 		// Delete chunk data from filesystem
-		if err := db.chunkStorage.DeleteChunk(chunkID); err != nil {
+		if err := db.ChunkStorage.DeleteChunk(chunkID); err != nil {
 			// Log error but continue
 			fmt.Printf("Warning: failed to delete chunk %s: %v\n", chunkID, err)
 		}
 
 		// Delete chunk metadata
-		if err := db.metadata.DeleteChunk(chunkID); err != nil {
+		if err := db.Metadata.DeleteChunk(chunkID); err != nil {
 			fmt.Printf("Warning: failed to delete chunk metadata %s: %v\n", chunkID, err)
 		}
 	}
 
 	// Delete object metadata
-	return db.metadata.DeleteObject(bucket, key)
+	return db.Metadata.DeleteObject(bucket, key)
 }
 
 // ListObjects lists objects in a bucket
-func (db *BucketDB) ListObjects(bucket, prefix string, maxKeys int) (*ListObjectsResult, error) {
-	return db.metadata.ListObjects(bucket, prefix, maxKeys)
+func (db *BucketDB) ListObjects(bucket, prefix string, maxKeys int) (*types.ListObjectsResult, error) {
+	return db.Metadata.ListObjects(bucket, prefix, maxKeys)
 }
 
 // ===== STATISTICS =====
 
 // GetStats retrieves storage statistics
-func (db *BucketDB) GetStats() (*StorageStats, error) {
-	stats, err := db.metadata.GetStats()
+func (db *BucketDB) GetStats() (*types.StorageStats, error) {
+	stats, err := db.Metadata.GetStats()
 	if err != nil {
 		return nil, err
 	}
 
 	// Get disk statistics
-	diskUsed, diskTotal, err := db.chunkStorage.GetDiskStats()
+	diskUsed, diskTotal, err := db.ChunkStorage.GetDiskStats()
 	if err == nil {
 		stats.DiskUsedBytes = diskUsed
 		stats.DiskTotalBytes = diskTotal
@@ -399,16 +456,16 @@ func (db *BucketDB) writeSingleChunk(objectID string, index int, data []byte) (s
 	chunkID := db.generateID()
 
 	// Write chunk to filesystem
-	diskPath, err := db.chunkStorage.WriteChunk(chunkID, data)
+	diskPath, err := db.ChunkStorage.WriteChunk(chunkID, data)
 	if err != nil {
 		return "", err
 	}
 
 	// Calculate checksum
-	checksum := db.chunkStorage.CalculateChecksum(data)
+	checksum := db.ChunkStorage.CalculateChecksum(data)
 
 	// Create chunk metadata
-	chunk := &Chunk{
+	chunk := &types.Chunk{
 		ChunkID:  chunkID,
 		ObjectID: objectID,
 		Index:    index,
@@ -418,8 +475,8 @@ func (db *BucketDB) writeSingleChunk(objectID string, index int, data []byte) (s
 	}
 
 	// Save chunk metadata
-	if err := db.metadata.SaveChunk(chunk); err != nil {
-		db.chunkStorage.DeleteChunk(chunkID) // Cleanup
+	if err := db.Metadata.SaveChunk(chunk); err != nil {
+		db.ChunkStorage.DeleteChunk(chunkID) // Cleanup
 		return "", err
 	}
 
@@ -434,7 +491,7 @@ func (db *BucketDB) writeMultipleChunks(objectID string, data []byte) ([]string,
 
 	for offset < len(data) {
 		// Calculate chunk size
-		end := offset + int(db.config.ChunkSize)
+		end := offset + int(db.Config.ChunkSize)
 		if end > len(data) {
 			end = len(data)
 		}
@@ -446,8 +503,8 @@ func (db *BucketDB) writeMultipleChunks(objectID string, data []byte) ([]string,
 		if err != nil {
 			// Cleanup already written chunks
 			for _, id := range chunkIDs {
-				db.chunkStorage.DeleteChunk(id)
-				db.metadata.DeleteChunk(id)
+				db.ChunkStorage.DeleteChunk(id)
+				db.Metadata.DeleteChunk(id)
 			}
 			return nil, err
 		}
@@ -461,7 +518,7 @@ func (db *BucketDB) writeMultipleChunks(objectID string, data []byte) ([]string,
 }
 
 // getObjectRange retrieves a range of bytes from an object
-func (db *BucketDB) getObjectRange(obj *Object, start, end int64) ([]byte, error) {
+func (db *BucketDB) getObjectRange(obj *types.Object, start, end int64) ([]byte, error) {
 	if end == 0 || end > obj.Size {
 		end = obj.Size
 	}
@@ -474,7 +531,7 @@ func (db *BucketDB) getObjectRange(obj *Object, start, end int64) ([]byte, error
 	currentPos := int64(0)
 
 	// Sort chunks by index
-	chunks, err := db.metadata.GetChunksForObject(obj.ObjectID)
+	chunks, err := db.Metadata.GetChunksForObject(obj.ObjectID)
 	if err != nil {
 		return nil, err
 	}
@@ -510,7 +567,7 @@ func (db *BucketDB) getObjectRange(obj *Object, start, end int64) ([]byte, error
 		}
 
 		// Read chunk range
-		chunkData, err := db.chunkStorage.ReadChunkRange(chunk.ChunkID, chunkStart, chunkReadEnd)
+		chunkData, err := db.ChunkStorage.ReadChunkRange(chunk.ChunkID, chunkStart, chunkReadEnd)
 		if err != nil {
 			return nil, err
 		}
@@ -531,13 +588,13 @@ func (db *BucketDB) generateID() string {
 
 // registerHooks registers ClusterKit lifecycle hooks
 func (db *BucketDB) registerHooks() {
-	db.cluster.OnPartitionChange(func(event *clusterkit.PartitionChangeEvent) {
+	db.Cluster.OnPartitionChange(func(event *clusterkit.PartitionChangeEvent) {
 		// Only move data if we are the destination node
-		if event.CopyToNode.ID != db.config.Cluster.NodeID {
+		if event.CopyToNode.ID != db.Config.Cluster.NodeID {
 			return
 		}
 
-		log.Printf("[BucketDB] 🔄 Partition %s assigned to this node (reason: %s)", event.PartitionID, event.ChangeReason)
+		slog.Info("Partition assigned to this node", "partition", event.PartitionID, "reason", event.ChangeReason)
 
 		if len(event.CopyFromNodes) == 0 {
 			return // New cluster/partition
@@ -547,33 +604,33 @@ func (db *BucketDB) registerHooks() {
 		go db.syncPartitionData(event.PartitionID, event.CopyFromNodes)
 	})
 
-	db.cluster.OnNodeRejoin(func(event *clusterkit.NodeRejoinEvent) {
-		if event.Node.ID == db.config.Cluster.NodeID {
-			log.Printf("[BucketDB] 🔄 I'm rejoining the cluster after %v offline. Clearing stale data.", event.OfflineDuration)
+	db.Cluster.OnNodeRejoin(func(event *clusterkit.NodeRejoinEvent) {
+		if event.Node.ID == db.Config.Cluster.NodeID {
+			slog.Info("Rejoining cluster", "offline_duration", event.OfflineDuration)
 			// Optional: Clear stale metadata/chunks to ensure consistency
 		}
 	})
 }
 
 // GetObjectsInPartition returns all object metadata for a specific partition
-func (db *BucketDB) GetObjectsInPartition(partitionID string) ([]*Object, error) {
-	return db.metadata.GetObjectsInPartition(partitionID)
+func (db *BucketDB) GetObjectsInPartition(partitionID string) ([]*types.Object, error) {
+	return db.Metadata.GetObjectsInPartition(partitionID)
 }
 
 // GetChunkData returns the raw data for a chunk
 func (db *BucketDB) GetChunkData(chunkID string) ([]byte, error) {
-	return db.chunkStorage.ReadChunk(chunkID)
+	return db.ChunkStorage.ReadChunk(chunkID)
 }
 
 // syncPartitionData fetches objects and chunks for a partition from source nodes
 func (db *BucketDB) syncPartitionData(partitionID string, sources []*clusterkit.Node) {
 	for _, source := range sources {
-		log.Printf("[BucketDB] 📥 Syncing partition %s from node %s", partitionID, source.ID)
+		slog.Info("Syncing partition", "partition", partitionID, "node", source.ID)
 
 		// 1. Fetch object list
 		apiAddr := source.Services["api"]
 		if apiAddr == "" {
-			log.Printf("[BucketDB] ⚠️ No API service for source node %s, skipping", source.ID)
+			slog.Warn("No API service for source node", "node", source.ID)
 			continue
 		}
 
@@ -588,42 +645,46 @@ func (db *BucketDB) syncPartitionData(partitionID string, sources []*clusterkit.
 		}
 		target := host + apiAddr
 
-		url := fmt.Sprintf("http://%s/internal/partition/%s", target, partitionID)
-		resp, err := http.Get(url)
+		protocol := "http"
+		if db.Config.TLS.Enabled {
+			protocol = "https"
+		}
+		url := fmt.Sprintf("%s://%s/internal/partition/%s", protocol, target, partitionID)
+		resp, err := db.client.Get(url)
 		if err != nil {
-			log.Printf("[BucketDB] ❌ Failed to fetch partition list from %s: %v", source.ID, err)
+			slog.Error("Failed to fetch partition list", "node", source.ID, "error", err)
 			continue
 		}
 
-		var objects []*Object
+		var objects []*types.Object
 		decodeErr := json.NewDecoder(resp.Body).Decode(&objects)
 		resp.Body.Close() // Close immediately after use
 
 		if decodeErr != nil {
-			log.Printf("[BucketDB] ❌ Failed to decode partition data from %s: %v", source.ID, decodeErr)
+			slog.Error("Failed to decode partition data", "node", source.ID, "error", decodeErr)
 			continue
 		}
 
 		// 2. Fetch metadata and chunks for each object
 		for _, obj := range objects {
-			log.Printf("[BucketDB]   📄 Syncing object %s/%s", obj.Bucket, obj.Key)
+			slog.Info("Syncing object", "bucket", obj.Bucket, "key", obj.Key)
 
 			// Save metadata
-			if err := db.metadata.SaveObject(obj); err != nil {
-				log.Printf("[BucketDB]     ❌ Failed to save object metadata: %v", err)
+			if err := db.Metadata.SaveObject(obj); err != nil {
+				slog.Error("Failed to save object metadata", "error", err)
 				continue
 			}
 
 			// Fetch chunks
 			for i, chunkID := range obj.ChunkIDs {
-				if db.chunkStorage.ChunkExists(chunkID) {
+				if db.ChunkStorage.ChunkExists(chunkID) {
 					continue
 				}
 
-				chunkURL := fmt.Sprintf("http://%s/internal/chunk/%s", target, chunkID)
-				cResp, err := http.Get(chunkURL)
+				chunkURL := fmt.Sprintf("%s://%s/internal/chunk/%s", protocol, target, chunkID)
+				cResp, err := db.client.Get(chunkURL)
 				if err != nil {
-					log.Printf("[BucketDB]     ❌ Failed to fetch chunk %s: %v", chunkID, err)
+					slog.Error("Failed to fetch chunk", "id", chunkID, "error", err)
 					continue
 				}
 
@@ -631,35 +692,35 @@ func (db *BucketDB) syncPartitionData(partitionID string, sources []*clusterkit.
 				cResp.Body.Close() // Close immediately, not deferred
 
 				if readErr != nil {
-					log.Printf("[BucketDB]     ❌ Failed to read chunk %s: %v", chunkID, readErr)
+					slog.Error("Failed to read chunk", "id", chunkID, "error", readErr)
 					continue
 				}
 
 				// Write chunk to storage
-				diskPath, writeErr := db.chunkStorage.WriteChunk(chunkID, data)
+				diskPath, writeErr := db.ChunkStorage.WriteChunk(chunkID, data)
 				if writeErr != nil {
-					log.Printf("[BucketDB]     ❌ Failed to write chunk %s: %v", chunkID, writeErr)
+					slog.Error("Failed to write chunk", "id", chunkID, "error", writeErr)
 					continue
 				}
 
 				// Re-create chunk metadata with proper index
-				chunkMeta := &Chunk{
+				chunkMeta := &types.Chunk{
 					ChunkID:   chunkID,
 					ObjectID:  obj.ObjectID,
 					Index:     i, // Fixed: Added proper index
 					Size:      int64(len(data)),
-					Checksum:  db.chunkStorage.CalculateChecksum(data),
+					Checksum:  db.ChunkStorage.CalculateChecksum(data),
 					DiskPath:  diskPath,
 					CreatedAt: time.Now(),
 				}
 
-				if err := db.metadata.SaveChunk(chunkMeta); err != nil {
-					log.Printf("[BucketDB]     ❌ Failed to save chunk metadata %s: %v", chunkID, err)
+				if err := db.Metadata.SaveChunk(chunkMeta); err != nil {
+					slog.Error("Failed to save chunk metadata", "id", chunkID, "error", err)
 					continue
 				}
 			}
 		}
-		log.Printf("[BucketDB] ✅ Finished syncing partition %s from node %s", partitionID, source.ID)
+		slog.Info("Finished syncing partition", "partition", partitionID, "node", source.ID)
 		break // Success
 	}
 }
