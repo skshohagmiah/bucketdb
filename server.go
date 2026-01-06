@@ -441,7 +441,7 @@ const uiHTML = `
 
         .list-header {
             display: grid;
-            grid-template-columns: 2.5fr 1fr 1fr;
+            grid-template-columns: 2fr 1fr 1fr 0.8fr 1.2fr;
             padding: 1rem;
             color: var(--text-dim);
             font-size: 0.85rem;
@@ -452,7 +452,7 @@ const uiHTML = `
 
         .object-item {
             display: grid;
-            grid-template-columns: 2.5fr 1fr 1fr;
+            grid-template-columns: 2fr 1fr 1fr 0.8fr 1.2fr;
             padding: 1.25rem 1rem;
             border-top: 1px solid var(--border);
             align-items: center;
@@ -460,9 +460,28 @@ const uiHTML = `
 
         .object-item:hover { background: rgba(255, 255, 255, 0.03); }
 
-        .obj-name { font-weight: 600; color: var(--text-main); display: flex; align-items: center; gap: 0.75rem; }
+        .obj-name { font-weight: 600; color: var(--text-main); display: flex; align-items: center; gap: 0.75rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .obj-meta { color: var(--text-dim); font-size: 0.9rem; }
         .obj-size { font-family: 'JetBrains Mono', monospace; font-size: 0.85rem; color: var(--accent); }
+        .obj-actions { display: flex; gap: 0.5rem; justify-content: flex-end; }
+
+        .action-btn {
+            padding: 0.4rem 0.8rem;
+            border-radius: 0.5rem;
+            border: 1px solid var(--border);
+            background: rgba(255, 255, 255, 0.05);
+            color: var(--text-main);
+            font-size: 0.8rem;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.3rem;
+        }
+
+        .action-btn:hover { background: rgba(255, 255, 255, 0.1); border-color: var(--primary); color: var(--primary); }
+        .btn-primary { background: rgba(129, 140, 248, 0.15); border-color: rgba(129, 140, 248, 0.3); color: var(--primary); }
+        .btn-primary:hover { background: rgba(129, 140, 248, 0.25); }
 
         pre {
             font-family: 'JetBrains Mono', monospace;
@@ -500,7 +519,7 @@ const uiHTML = `
             
             <div class="form-group">
                 <label>Storage Bucket</label>
-                <input type="text" id="bucket" value="my-bucket" placeholder="Enter bucket name">
+                <input type="text" id="bucket" value="my-bucket" placeholder="Enter bucket name" onchange="refresh()">
             </div>
 
             <div class="form-group">
@@ -526,11 +545,19 @@ const uiHTML = `
             <pre id="cluster-info">Initializing coordination matrix...</pre>
 
             <div style="margin-top: 2rem">
-                <div class="section-title" style="font-size: 1rem">Recent Objects</div>
+                <div class="section-title" style="font-size: 1rem; justify-content: space-between;">
+                    <span>Object Explorer</span>
+                    <button class="action-btn" onclick="refresh()">
+                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+                         Refresh
+                    </button>
+                </div>
                 <div class="list-header">
                     <span>Key</span>
-                    <span>Partition</span>
+                    <span>Type</span>
+                    <span>Part</span>
                     <span>Size</span>
+                    <span style="text-align: right">Actions</span>
                 </div>
                 <div id="object-list">
                     <!-- Objects will be injected here -->
@@ -606,18 +633,48 @@ const uiHTML = `
                     return;
                 }
 
-                objList.innerHTML = objects.map(obj => 
-                    '<div class="object-item">' +
-                        '<div class="obj-name">' +
-                            '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color: var(--primary)"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>' +
+                objList.innerHTML = objects.map(obj => {
+                    const url = '/objects/' + obj.bucket + '/' + obj.key;
+                    // Truncate content type
+                    let type = obj.content_type || 'application/octet-stream';
+                    if (type.length > 20) type = type.substring(0, 17) + '...';
+
+                    return '<div class="object-item">' +
+                        '<div class="obj-name" title="' + obj.key + '">' +
+                            '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color: var(--primary); min-width: 18px;"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>' +
                             obj.key +
                         '</div>' +
+                        '<div class="obj-meta">' + type + '</div>' +
                         '<div class="obj-meta">P-' + (obj.partition_id || '?') + '</div>' +
                         '<div class="obj-size">' + formatBytes(obj.size) + '</div>' +
-                    '</div>'
-                ).join('');
+                        '<div class="obj-actions">' +
+                            '<a href="' + url + '" target="_blank" class="action-btn btn-primary" title="Open / Download">' +
+                                '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>' +
+                                'Open' +
+                            '</a>' +
+                            '<button onclick="deleteObject(\'' + obj.bucket + '\', \'' + obj.key + '\')" class="action-btn" title="Delete">' +
+                                '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>' +
+                            '</button>' +
+                        '</div>' +
+                    '</div>';
+                }).join('');
             } catch (err) {
                 console.error('Refresh failed:', err);
+            }
+        }
+
+        async function deleteObject(bucket, key) {
+            if (!confirm('Are you sure you want to delete ' + key + '?')) return;
+            try {
+                const response = await fetch('/objects/' + bucket + '/' + key, { method: 'DELETE' });
+                if (response.ok) {
+                    showStatus('Deleted ' + key, 'success');
+                    refresh();
+                } else {
+                    showStatus('Failed to delete: ' + await response.text(), 'error');
+                }
+            } catch (err) {
+                showStatus('Network error: ' + err.message, 'error');
             }
         }
 

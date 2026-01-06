@@ -8,36 +8,6 @@ BucketDB is a production-grade, distributed object storage engine designed for m
 
 BucketDB employs a decentralized, masterless architecture (via Raft-based coordination) to eliminate single points of failure.
 
-### High-Level Component Interaction
-
-```mermaid
-graph TD
-    Client[Client Application] -->|HTTP/REST| API[Public API Gateway]
-    API -->|Route| Coordinator[BucketDB Coordinator]
-    
-    subgraph "Control Plane (ClusterKit)"
-        Coordinator --> CK[Consistent Hashing Engine]
-        CK --> Partitions[64 Virtual Partitions]
-        Partitions --> Election[Raft Leader Election]
-        Partitions --> Rebalance[Auto-Migration Hook]
-    end
-    
-    subgraph "Data Plane (Storage Engine)"
-        Coordinator --> MetadataStore[BadgerDB Metadata]
-        Coordinator --> ChunkStore[Filesystem Shards]
-        
-        MetadataStore --> Index["Object & Bucket Indexes"]
-        ChunkStore --> Blobs["Immutable Data Chunks"]
-    end
-    
-    subgraph "Distributed Features"
-        Coordinator --> Proxy[Request Forwarder]
-        Coordinator --> Sync[Peer-to-Peer Sync]
-    end
-```
-
----
-
 ## ✨ Key Features
 
 ### 🌍 Distributed Capabilities
@@ -67,7 +37,46 @@ graph TD
 go get github.com/skshohagmiah/bucketdb
 ```
 
-### Running the Distributed Cluster (Local Demo)
+### 🐳 Running with Docker
+
+Since BucketDB is currently self-hosted, you can build and run it locally.
+
+#### Option 1: Docker Compose (Recommended Cluster)
+Starts a full 3-node cluster with automatic networking and persistent storage.
+
+```bash
+# Build and start the cluster
+docker compose up -d --build
+
+# View logs
+docker compose logs -f
+
+# Stop the cluster
+docker compose down
+```
+
+**Access Points:**
+- **Node 1**: `http://localhost:9080` (API) | `http://localhost:8080` (Raft)
+- **Node 2**: `http://localhost:9081` (API) | `http://localhost:8081` (Raft)
+- **Node 3**: `http://localhost:9082` (API) | `http://localhost:8082` (Raft)
+
+#### Option 2: Single Node Manual Run
+If you just want a single instance for testing:
+
+```bash
+# 1. Build the image
+docker build -t bucketdb:latest .
+
+# 2. Run a single node
+docker run -d \
+  --name bucketdb \
+  -p 9080:9080 \
+  -p 8080:8080 \
+  bucketdb:latest \
+  -id node-1 -bootstrap=true -http :8080 -api :9080
+```
+
+### Running Manually (Local Demo)
 The included simulation script starts a 3-node cluster with isolated storage and coordination ports.
 
 ```bash
@@ -206,6 +215,89 @@ When a new node joins:
 2.  **Migration Trigger**: The `OnPartitionChange` hook fires on the new owner.
 3.  **Syncing**: The new node fetches object metadata and raw chunks from the previous owners.
 4.  **Atomic Handover**: Once syncing is complete, the new node begins serving primary requests for those partitions.
+
+---
+
+## 💻 Client Code Examples
+
+Connect to your Dockerized cluster using standard HTTP clients.
+
+### Go
+```go
+package main
+
+import (
+	"bytes"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+)
+
+func main() {
+	// Upload
+	data := []byte("Hello BucketDB from Go!")
+	resp, _ := http.Post("http://localhost:9080/objects/my-bucket/go-test.txt", "text/plain", bytes.NewReader(data))
+	resp.Body.Close()
+	fmt.Println("Upload Status:", resp.Status)
+
+	// Download
+	resp, _ = http.Get("http://localhost:9080/objects/my-bucket/go-test.txt")
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	fmt.Println("Content:", string(body))
+}
+```
+
+### Node.js (Axios)
+```javascript
+const axios = require('axios');
+const fs = require('fs');
+
+async function run() {
+    const api = axios.create({ baseURL: 'http://localhost:9080' });
+
+    // 1. Create Bucket
+    await api.post('/buckets?name=images');
+
+    // 2. Upload File
+    const fileData = fs.readFileSync('photo.jpg');
+    await api.post('/objects/images/vacation.jpg', fileData, {
+        headers: { 'Content-Type': 'image/jpeg' }
+    });
+    console.log('✅ Upload complete');
+
+    // 3. Download File
+    const response = await api.get('/objects/images/vacation.jpg', { responseType: 'arraybuffer' });
+    fs.writeFileSync('downloaded.jpg', response.data);
+    console.log('✅ Download complete');
+}
+
+run().catch(console.error);
+```
+
+### Python
+```python
+import requests
+
+API_URL = "http://localhost:9080"
+
+# 1. Upload
+with open("report.pdf", "rb") as f:
+    data = f.read()
+    resp = requests.post(
+        f"{API_URL}/objects/docs/report.pdf", 
+        data=data,
+        headers={"Content-Type": "application/pdf"}
+    )
+print(f"Upload: {resp.status_code}")
+
+# 2. Download
+resp = requests.get(f"{API_URL}/objects/docs/report.pdf")
+with open("downloaded_report.pdf", "wb") as f:
+    f.write(resp.content)
+print("Download complete")
+```
 
 ---
 

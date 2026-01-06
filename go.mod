@@ -1,4 +1,4 @@
-module bucketdb
+module github.com/skshohagmiah/bucketdb
 
 go 1.24.4
 

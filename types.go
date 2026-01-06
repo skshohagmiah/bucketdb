@@ -69,6 +69,9 @@ type Config struct {
 
 	// Cluster configuration
 	Cluster clusterkit.Options
+
+	// Standalone mode (single node, no cluster coordination)
+	Standalone bool
 }
 
 // DefaultConfig returns default configuration

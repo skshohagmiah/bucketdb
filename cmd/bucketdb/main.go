@@ -1,13 +1,14 @@
 package main
 
 import (
-	"bucketdb"
 	"flag"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
+
+	"github.com/skshohagmiah/bucketdb"
 )
 
 func main() {

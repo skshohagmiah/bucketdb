@@ -1,0 +1,21 @@
+{
+  "id": "clusterkit-cluster",
+  "name": "clusterkit-cluster",
+  "nodes": [
+    {
+      "id": "test-node",
+      "ip": ":0",
+      "port": 0,
+      "name": "Test-node",
+      "status": "active"
+    }
+  ],
+  "partition_map": {
+    "partitions": {}
+  },
+  "config": {
+    "cluster_name": "clusterkit-cluster",
+    "partition_count": 16,
+    "replication_factor": 3
+  }
+}

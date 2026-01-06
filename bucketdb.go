@@ -72,7 +72,19 @@ func NewBucketDB(config *Config) (*BucketDB, error) {
 
 // Close closes the object store
 func (db *BucketDB) Close() error {
-	return db.metadata.Close()
+	// Stop cluster coordination first
+	if db.cluster != nil {
+		if err := db.cluster.Stop(); err != nil {
+			log.Printf("[BucketDB] Warning: failed to stop cluster: %v", err)
+		}
+	}
+
+	// Close metadata store
+	if err := db.metadata.Close(); err != nil {
+		return fmt.Errorf("failed to close metadata: %w", err)
+	}
+
+	return nil
 }
 
 // ===== BUCKET OPERATIONS =====
@@ -102,25 +114,39 @@ func (db *BucketDB) PutObject(bucket, key string, data []byte, opts *PutObjectOp
 	}
 
 	// Calculate partition
-	partition, err := db.cluster.GetPartition(key)
-	if err != nil {
-		return fmt.Errorf("failed to get partition: %w", err)
+	var partitionID string
+	var isPrimary bool
+	var partition *clusterkit.Partition
+
+	if db.config.Standalone {
+		partitionID = "0"
+		isPrimary = true
+	} else {
+		p, err := db.cluster.GetPartition(key)
+		if err != nil {
+			return fmt.Errorf("failed to get partition: %w", err)
+		}
+		partition = p
+		partitionID = partition.ID
+		isPrimary = db.cluster.IsPrimary(partition)
 	}
 
 	// If not primary, forward will be handled by HTTP server (implemented separately)
-	if !db.cluster.IsPrimary(partition) {
+	if !isPrimary {
 		log.Printf("[BucketDB] Warning: PutObject called on non-primary node for key %s", key)
 	}
 
 	// Store locally
-	if err := db.storeObjectLocally(bucket, key, partition.ID, data, opts); err != nil {
+	if err := db.storeObjectLocally(bucket, key, partitionID, data, opts); err != nil {
 		return err
 	}
 
 	// Replication (Active write-time)
-	replicas := db.cluster.GetReplicas(partition)
-	if len(replicas) > 0 {
-		go db.replicateToNodes(bucket, key, data, opts, replicas)
+	if !db.config.Standalone {
+		replicas := db.cluster.GetReplicas(partition)
+		if len(replicas) > 0 {
+			go db.replicateToNodes(bucket, key, data, opts, replicas)
+		}
 	}
 
 	return nil
@@ -217,14 +243,18 @@ func (db *BucketDB) replicateToNodes(bucket, key string, data []byte, opts *PutO
 			continue
 		}
 
-		host := "localhost"
-		if strings.Contains(node.IP, ":") {
-			h, _, err := net.SplitHostPort(node.IP)
+		// Use actual node IP instead of hardcoded localhost
+		host := node.IP
+		if host == "" {
+			host = "localhost" // Fallback only if IP is empty
+		}
+
+		// Handle IP:port format
+		if strings.Contains(host, ":") {
+			h, _, err := net.SplitHostPort(host)
 			if err == nil && h != "" {
 				host = h
 			}
-		} else if node.IP != "" {
-			host = node.IP
 		}
 
 		target := host + apiAddr
@@ -249,6 +279,8 @@ func (db *BucketDB) replicateToNodes(bucket, key string, data []byte, opts *PutO
 
 		if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 			log.Printf("[BucketDB] ❌ Replication failed to %s: status %d", node.ID, resp.StatusCode)
+		} else {
+			log.Printf("[BucketDB] ✅ Replicated to %s successfully", node.ID)
 		}
 	}
 }
@@ -547,18 +579,24 @@ func (db *BucketDB) syncPartitionData(partitionID string, sources []*clusterkit.
 			if err == nil && h != "" {
 				host = h
 			}
+		} else if source.IP != "" {
+			host = source.IP
 		}
 		target := host + apiAddr
 
 		url := fmt.Sprintf("http://%s/internal/partition/%s", target, partitionID)
 		resp, err := http.Get(url)
 		if err != nil {
+			log.Printf("[BucketDB] ❌ Failed to fetch partition list from %s: %v", source.ID, err)
 			continue
 		}
-		defer resp.Body.Close()
 
 		var objects []*Object
-		if err := json.NewDecoder(resp.Body).Decode(&objects); err != nil {
+		decodeErr := json.NewDecoder(resp.Body).Decode(&objects)
+		resp.Body.Close() // Close immediately after use
+
+		if decodeErr != nil {
+			log.Printf("[BucketDB] ❌ Failed to decode partition data from %s: %v", source.ID, decodeErr)
 			continue
 		}
 
@@ -567,10 +605,13 @@ func (db *BucketDB) syncPartitionData(partitionID string, sources []*clusterkit.
 			log.Printf("[BucketDB]   📄 Syncing object %s/%s", obj.Bucket, obj.Key)
 
 			// Save metadata
-			db.metadata.SaveObject(obj)
+			if err := db.metadata.SaveObject(obj); err != nil {
+				log.Printf("[BucketDB]     ❌ Failed to save object metadata: %v", err)
+				continue
+			}
 
 			// Fetch chunks
-			for _, chunkID := range obj.ChunkIDs {
+			for i, chunkID := range obj.ChunkIDs {
 				if db.chunkStorage.ChunkExists(chunkID) {
 					continue
 				}
@@ -581,20 +622,37 @@ func (db *BucketDB) syncPartitionData(partitionID string, sources []*clusterkit.
 					log.Printf("[BucketDB]     ❌ Failed to fetch chunk %s: %v", chunkID, err)
 					continue
 				}
-				defer cResp.Body.Close()
 
-				data, _ := io.ReadAll(cResp.Body)
-				db.chunkStorage.WriteChunk(chunkID, data)
+				data, readErr := io.ReadAll(cResp.Body)
+				cResp.Body.Close() // Close immediately, not deferred
 
-				// Re-create chunk metadata
-				db.metadata.SaveChunk(&Chunk{
+				if readErr != nil {
+					log.Printf("[BucketDB]     ❌ Failed to read chunk %s: %v", chunkID, readErr)
+					continue
+				}
+
+				// Write chunk to storage
+				diskPath, writeErr := db.chunkStorage.WriteChunk(chunkID, data)
+				if writeErr != nil {
+					log.Printf("[BucketDB]     ❌ Failed to write chunk %s: %v", chunkID, writeErr)
+					continue
+				}
+
+				// Re-create chunk metadata with proper index
+				chunkMeta := &Chunk{
 					ChunkID:   chunkID,
 					ObjectID:  obj.ObjectID,
+					Index:     i, // Fixed: Added proper index
 					Size:      int64(len(data)),
 					Checksum:  db.chunkStorage.CalculateChecksum(data),
-					DiskPath:  "", // Will be updated by WriteChunk
+					DiskPath:  diskPath,
 					CreatedAt: time.Now(),
-				})
+				}
+
+				if err := db.metadata.SaveChunk(chunkMeta); err != nil {
+					log.Printf("[BucketDB]     ❌ Failed to save chunk metadata %s: %v", chunkID, err)
+					continue
+				}
 			}
 		}
 		log.Printf("[BucketDB] ✅ Finished syncing partition %s from node %s", partitionID, source.ID)

@@ -1,10 +1,11 @@
 package main
 
 import (
-	"bucketdb"
 	"fmt"
 	"log"
 	"os"
+
+	"github.com/skshohagmiah/bucketdb"
 )
 
 func main() {

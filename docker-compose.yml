@@ -1,0 +1,64 @@
+services:
+  node-1:
+    build: .
+    hostname: node-1
+    container_name: bucketdb-node-1
+    command: >
+      -id node-1
+      -http :8080
+      -api :9080
+      -bootstrap=true
+    ports:
+      - "9080:9080" # Public API
+      - "8080:8080" # Coordination
+    volumes:
+      - node1-data:/data
+    networks:
+      - bucketdb-net
+
+  node-2:
+    build: .
+    hostname: node-2
+    container_name: bucketdb-node-2
+    command: >
+      -id node-2
+      -http :8081
+      -api :9081
+      -join node-1:8080
+    ports:
+      - "9081:9081"
+      - "8081:8081"
+    volumes:
+      - node2-data:/data
+    depends_on:
+      - node-1
+    networks:
+      - bucketdb-net
+
+  node-3:
+    build: .
+    hostname: node-3
+    container_name: bucketdb-node-3
+    command: >
+      -id node-3
+      -http :8082
+      -api :9082
+      -join node-1:8080
+    ports:
+      - "9082:9082"
+      - "8082:8082"
+    volumes:
+      - node3-data:/data
+    depends_on:
+      - node-1
+    networks:
+      - bucketdb-net
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+
+networks:
+  bucketdb-net:
+    driver: bridge
