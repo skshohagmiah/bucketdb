@@ -274,12 +274,18 @@ func (s *Server) handleInternalReplicate(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
+	// Hybrid Handler: Dashboard for Browser, S3 for Clients
+
+	// 1. serve Dashboard for root HTML requests
+	if r.URL.Path == "/" && strings.Contains(r.Header.Get("Accept"), "text/html") {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(uiHTML))
 		return
 	}
-	w.Header().Set("Content-Type", "text/html")
-	w.Write([]byte(uiHTML))
+
+	// 2. Delegate everything else to S3 Gateway
+	// This captures /bucket/key requests which match the "/" catch-all pattern
+	s.handleS3Request(w, r)
 }
 
 const uiHTML = `

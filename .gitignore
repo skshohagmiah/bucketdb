@@ -17,6 +17,7 @@
 # BucketDB Data
 data/
 storage/
+clusterkit-data/
 
 # Logs
 *.log

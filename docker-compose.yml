@@ -1,6 +1,6 @@
 services:
   node-1:
-    build: .
+    image: skshohagmiah/bucketdb:latest
     hostname: node-1
     container_name: bucketdb-node-1
     command: >
@@ -17,7 +17,7 @@ services:
       - bucketdb-net
 
   node-2:
-    build: .
+    image: skshohagmiah/bucketdb:latest
     hostname: node-2
     container_name: bucketdb-node-2
     command: >
@@ -36,7 +36,7 @@ services:
       - bucketdb-net
 
   node-3:
-    build: .
+    image: skshohagmiah/bucketdb:latest
     hostname: node-3
     container_name: bucketdb-node-3
     command: >

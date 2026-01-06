@@ -252,8 +252,12 @@ func (db *BucketDB) replicateToNodes(bucket, key string, data []byte, opts *PutO
 		// Handle IP:port format
 		if strings.Contains(host, ":") {
 			h, _, err := net.SplitHostPort(host)
-			if err == nil && h != "" {
-				host = h
+			if err == nil {
+				if h != "" {
+					host = h
+				} else {
+					host = "localhost" // Port only (e.g. :8082) -> localhost
+				}
 			}
 		}
 
