@@ -2,8 +2,10 @@ package api
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -71,8 +73,22 @@ func (s *Server) Start() error {
 	mux.Handle("/internal/partition/", s.instrumentedHandler(s.handleInternalPartition, "/internal/partition/:id"))
 	mux.Handle("/internal/replicate/", s.instrumentedHandler(s.handleInternalReplicate, "/internal/replicate/:bucket/:key"))
 
+	// Multipart Upload API
+	mux.Handle("/multipart/", s.instrumentedHandler(s.handleMultipart, "/multipart/:bucket/:key"))
+
+	// Object Tagging API
+	mux.Handle("/objects/", s.instrumentedHandler(s.handleObjectTagging, "/objects/:bucket/:key/tags"))
+
+	// Lifecycle Policy API
+	mux.Handle("/lifecycle/", s.instrumentedHandler(s.handleLifecycle, "/lifecycle/:bucket"))
+
 	// Observability
 	mux.Handle("/metrics", promhttp.Handler())
+
+	// Health checks
+	mux.Handle("/health", s.instrumentedHandler(s.handleHealth, "/health"))
+	mux.Handle("/health/ready", s.instrumentedHandler(s.handleHealthReady, "/health/ready"))
+	mux.Handle("/health/live", s.instrumentedHandler(s.handleHealthLive, "/health/live"))
 
 	slog.Info("Server starting", "port", s.port, "tls", s.db.Config.TLS.Enabled)
 
@@ -125,34 +141,82 @@ func (s *Server) handleObject(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		data, err := s.db.GetObject(bucket, key, nil)
+		// Parse Range header if present
+		var opts *types.GetObjectOptions
+		rangeHeader := r.Header.Get("Range")
+		if rangeHeader != "" {
+			opts = parseRangeHeader(rangeHeader)
+		}
+
+		// Use streaming for large files
+		meta, err := s.db.GetObjectMetadata(bucket, key)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
 		}
 
-		// Get metadata for Content-Type
-		meta, _ := s.db.GetObjectMetadata(bucket, key)
-		if meta != nil {
+		// Use streaming if object is large (larger than chunk size)
+		if meta.Size > s.db.Config.ChunkSize && (opts == nil || (opts.RangeStart == 0 && opts.RangeEnd == 0)) {
+			reader, obj, err := s.db.GetObjectAsStream(bucket, key, opts)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+			defer reader.Close()
+
+			w.Header().Set("Content-Type", obj.ContentType)
+			w.Header().Set("ETag", fmt.Sprintf("\"%s\"", obj.Checksum))
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", obj.Size))
+			io.Copy(w, reader)
+		} else {
+			// For small files or range requests, use in-memory method
+			data, err := s.db.GetObject(bucket, key, opts)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+
 			w.Header().Set("Content-Type", meta.ContentType)
+			w.Header().Set("ETag", fmt.Sprintf("\"%s\"", meta.Checksum))
+			if opts != nil && (opts.RangeStart > 0 || opts.RangeEnd > 0) {
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", opts.RangeStart, opts.RangeEnd-1, meta.Size))
+				w.WriteHeader(http.StatusPartialContent)
+			}
+			w.Write(data)
 		}
-		w.Write(data)
 
 	case http.MethodPost:
-		data, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "failed to read body", http.StatusBadRequest)
-			return
-		}
-
 		opts := &types.PutObjectOptions{
 			ContentType: r.Header.Get("Content-Type"),
 			Metadata:    make(map[string]string),
 		}
 
-		if err := s.db.PutObject(bucket, key, data, opts); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+		// Use streaming for large files if Content-Length is available
+		contentLength := r.ContentLength
+		if contentLength > 0 && contentLength > s.db.Config.ChunkSize {
+			// Use streaming for files larger than chunk size
+			err := s.db.PutObjectFromStream(bucket, key, r.Body, contentLength, opts)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		} else {
+			// For small files or unknown size, use in-memory method
+			data, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, "failed to read body", http.StatusBadRequest)
+				return
+			}
+			if err := s.db.PutObject(bucket, key, data, opts); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+
+		// Get the actual checksum from stored object for ETag
+		obj, err := s.db.GetObjectMetadata(bucket, key)
+		if err == nil && obj != nil {
+			w.Header().Set("ETag", fmt.Sprintf("\"%s\"", obj.Checksum))
 		}
 		w.WriteHeader(http.StatusCreated)
 
@@ -265,11 +329,6 @@ func (s *Server) ForwardRequest(nodeAddr string, r *http.Request) (*http.Respons
 
 // handleInternalReplicate handles incoming replication requests from other nodes
 func (s *Server) handleInternalReplicate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/internal/replicate/"), "/")
 	if len(parts) < 2 {
 		http.Error(w, "Invalid path", http.StatusBadRequest)
@@ -279,36 +338,58 @@ func (s *Server) handleInternalReplicate(w http.ResponseWriter, r *http.Request)
 	bucket := parts[0]
 	key := strings.Join(parts[1:], "/")
 
-	data, err := io.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, "Failed to read body", http.StatusInternalServerError)
-		return
-	}
+	switch r.Method {
+	case http.MethodPost:
+		// Replicate PUT operation
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Failed to read body", http.StatusInternalServerError)
+			return
+		}
 
-	opts := &types.PutObjectOptions{
-		ContentType: r.Header.Get("Content-Type"),
-		Metadata:    make(map[string]string),
-	}
+		opts := &types.PutObjectOptions{
+			ContentType: r.Header.Get("Content-Type"),
+			Metadata:    make(map[string]string),
+		}
 
-	// Extract metadata from header
-	if metaHeader := r.Header.Get("X-BucketDB-Meta"); metaHeader != "" {
-		json.Unmarshal([]byte(metaHeader), &opts.Metadata)
-	}
+		// Extract metadata from header
+		if metaHeader := r.Header.Get("X-BucketDB-Meta"); metaHeader != "" {
+			json.Unmarshal([]byte(metaHeader), &opts.Metadata)
+		}
 
-	// Store locally using internal storage logic (same package, so we can access storeObjectLocally)
-	partition, err := s.db.Cluster.GetPartition(key)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+		// Store locally using internal storage logic
+		partition, err := s.db.Cluster.GetPartition(key)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 
-	err = s.db.StoreObjectLocally(bucket, key, partition.ID, data, opts)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+		err = s.db.StoreObjectLocally(bucket, key, partition.ID, data, opts)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 
-	w.WriteHeader(http.StatusCreated)
+		w.WriteHeader(http.StatusCreated)
+
+	case http.MethodDelete:
+		// Replicate DELETE operation
+		err := s.db.DeleteObject(bucket, key)
+		if err != nil {
+			// If object doesn't exist, consider it already deleted (idempotent)
+			if strings.Contains(err.Error(), "not found") {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
@@ -326,22 +407,51 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	s.handleS3Request(w, r)
 }
 
-// instrumentedHandler wraps a handler with Prometheus metrics
+// instrumentedHandler wraps a handler with Prometheus metrics and request logging
 func (s *Server) instrumentedHandler(handler http.HandlerFunc, path string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 
+		// Generate request ID
+		requestID := generateRequestID()
+		r.Header.Set("X-Request-ID", requestID)
+		w.Header().Set("X-Request-ID", requestID)
+
 		// Use a response writer that captures the status code
 		wrapped := &responseWriter{ResponseWriter: w, status: http.StatusOK}
+
+		// Log request
+		slog.Info("Request started",
+			"request_id", requestID,
+			"method", r.Method,
+			"path", r.URL.Path,
+			"remote_addr", r.RemoteAddr,
+		)
 
 		handler.ServeHTTP(wrapped, r)
 
 		duration := time.Since(start).Seconds()
 		statusStr := fmt.Sprintf("%d", wrapped.status)
 
+		// Log response
+		slog.Info("Request completed",
+			"request_id", requestID,
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", wrapped.status,
+			"duration_ms", duration*1000,
+		)
+
 		metrics.HttpRequestsTotal.WithLabelValues(r.Method, path, statusStr).Inc()
 		metrics.HttpRequestDuration.WithLabelValues(r.Method, path).Observe(duration)
 	})
+}
+
+// generateRequestID generates a unique request ID
+func generateRequestID() string {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 type responseWriter struct {
@@ -352,6 +462,348 @@ type responseWriter struct {
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.status = code
 	rw.ResponseWriter.WriteHeader(code)
+}
+
+// parseRangeHeader parses HTTP Range header and returns GetObjectOptions
+// Supports formats: "bytes=0-1023", "bytes=1024-", "bytes=-512"
+func parseRangeHeader(rangeHeader string) *types.GetObjectOptions {
+	if rangeHeader == "" {
+		return nil
+	}
+
+	// Remove "bytes=" prefix
+	rangeStr := strings.TrimPrefix(rangeHeader, "bytes=")
+	if rangeStr == rangeHeader {
+		return nil // Invalid format
+	}
+
+	parts := strings.Split(rangeStr, "-")
+	if len(parts) != 2 {
+		return nil
+	}
+
+	var start, end int64
+	var err error
+
+	if parts[0] != "" {
+		start, err = parseInt64(parts[0])
+		if err != nil {
+			return nil
+		}
+	}
+
+	if parts[1] != "" {
+		end, err = parseInt64(parts[1])
+		if err != nil {
+			return nil
+		}
+		// Range end is inclusive in HTTP, but our code uses exclusive
+		end = end + 1
+	} else {
+		// Open-ended range: "bytes=1024-"
+		end = 0 // Will be set to object size
+	}
+
+	return &types.GetObjectOptions{
+		RangeStart: start,
+		RangeEnd:   end,
+	}
+}
+
+// parseInt64 is a helper to safely parse int64
+func parseInt64(s string) (int64, error) {
+	var val int64
+	_, err := fmt.Sscanf(s, "%d", &val)
+	return val, err
+}
+
+// Health check handlers
+
+// handleHealth returns detailed health status
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	health := map[string]interface{}{
+		"status":    "healthy",
+		"timestamp": time.Now().Unix(),
+		"version":   "1.0.0",
+	}
+
+	// Check cluster status
+	if s.db.Cluster != nil {
+		cluster := s.db.Cluster.GetCluster()
+		health["cluster"] = map[string]interface{}{
+			"nodes": len(cluster.Nodes),
+		}
+		if cluster.Nodes != nil {
+			health["cluster"].(map[string]interface{})["node_count"] = len(cluster.Nodes)
+		}
+	}
+
+	// Check storage stats
+	stats, err := s.db.GetStats()
+	if err == nil {
+		health["storage"] = map[string]interface{}{
+			"total_objects": stats.TotalObjects,
+			"total_size":    stats.TotalSize,
+			"disk_used_pct": stats.DiskUsedPercent,
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(health)
+}
+
+// handleHealthReady checks if the service is ready to accept traffic
+func (s *Server) handleHealthReady(w http.ResponseWriter, r *http.Request) {
+	// Check if cluster is ready
+	if s.db.Cluster != nil {
+		cluster := s.db.Cluster.GetCluster()
+		if len(cluster.Nodes) == 0 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"status":"not ready","reason":"no cluster nodes"}`))
+			return
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"status":"ready"}`))
+}
+
+// handleHealthLive checks if the service is alive
+func (s *Server) handleHealthLive(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(`{"status":"alive"}`))
+}
+
+// ===== MULTIPART UPLOAD HANDLERS =====
+
+// handleMultipart handles multipart upload operations
+func (s *Server) handleMultipart(w http.ResponseWriter, r *http.Request) {
+	// Parse path: /multipart/:bucket/:key
+	path := r.URL.Path[len("/multipart/"):]
+	parts := strings.Split(path, "/")
+	if len(parts) < 2 {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+	bucket := parts[0]
+	key := strings.Join(parts[1:], "/")
+
+	uploadID := r.URL.Query().Get("uploadId")
+
+	switch r.Method {
+	case http.MethodPost:
+		// Initiate multipart upload
+		if uploadID == "" {
+			opts := &types.PutObjectOptions{
+				ContentType: r.Header.Get("Content-Type"),
+			}
+			uploadID, err := s.db.InitiateMultipartUpload(bucket, key, opts)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"uploadId": uploadID})
+			return
+		}
+
+		// Upload part
+		partNumberStr := r.URL.Query().Get("partNumber")
+		if partNumberStr == "" {
+			http.Error(w, "partNumber required", http.StatusBadRequest)
+			return
+		}
+		var partNumber int
+		if _, err := fmt.Sscanf(partNumberStr, "%d", &partNumber); err != nil {
+			http.Error(w, "invalid partNumber", http.StatusBadRequest)
+			return
+		}
+
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "failed to read body", http.StatusBadRequest)
+			return
+		}
+
+		etag, err := s.db.UploadPart(bucket, key, uploadID, partNumber, data)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("ETag", fmt.Sprintf("\"%s\"", etag))
+		w.WriteHeader(http.StatusOK)
+
+	case http.MethodPut:
+		// Complete multipart upload
+		if uploadID == "" {
+			http.Error(w, "uploadId required", http.StatusBadRequest)
+			return
+		}
+
+		var parts []types.MultipartPart
+		if err := json.NewDecoder(r.Body).Decode(&parts); err != nil {
+			http.Error(w, "invalid parts data", http.StatusBadRequest)
+			return
+		}
+
+		obj, err := s.db.CompleteMultipartUpload(bucket, key, uploadID, parts)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("ETag", fmt.Sprintf("\"%s\"", obj.Checksum))
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"bucket":   obj.Bucket,
+			"key":      obj.Key,
+			"etag":     obj.Checksum,
+			"location": fmt.Sprintf("/objects/%s/%s", bucket, key),
+		})
+
+	case http.MethodDelete:
+		// Abort multipart upload
+		if uploadID == "" {
+			http.Error(w, "uploadId required", http.StatusBadRequest)
+			return
+		}
+
+		if err := s.db.AbortMultipartUpload(bucket, key, uploadID); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+
+	case http.MethodGet:
+		// List multipart uploads
+		prefix := r.URL.Query().Get("prefix")
+		maxUploads := 1000
+		if maxStr := r.URL.Query().Get("max-uploads"); maxStr != "" {
+			if parsed, err := parseInt64(maxStr); err == nil && parsed > 0 {
+				maxUploads = int(parsed)
+			}
+		}
+
+		uploads, err := s.db.ListMultipartUploads(bucket, prefix, maxUploads)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(uploads)
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// ===== OBJECT TAGGING HANDLERS =====
+
+// handleObjectTagging handles object tagging operations
+func (s *Server) handleObjectTagging(w http.ResponseWriter, r *http.Request) {
+	// Parse path: /objects/:bucket/:key/tags
+	path := strings.TrimPrefix(r.URL.Path, "/objects/")
+	path = strings.TrimSuffix(path, "/tags")
+	parts := strings.Split(path, "/")
+	if len(parts) < 2 {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+	bucket := parts[0]
+	key := strings.Join(parts[1:], "/")
+
+	switch r.Method {
+	case http.MethodPut:
+		// Put tags
+		var tags map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&tags); err != nil {
+			http.Error(w, "invalid tags data", http.StatusBadRequest)
+			return
+		}
+
+		if err := s.db.PutObjectTagging(bucket, key, tags); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+
+	case http.MethodGet:
+		// Get tags
+		tags, err := s.db.GetObjectTagging(bucket, key)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(tags)
+
+	case http.MethodDelete:
+		// Delete tags
+		if err := s.db.DeleteObjectTagging(bucket, key); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// ===== LIFECYCLE POLICY HANDLERS =====
+
+// handleLifecycle handles lifecycle policy operations
+func (s *Server) handleLifecycle(w http.ResponseWriter, r *http.Request) {
+	// Parse path: /lifecycle/:bucket
+	path := strings.TrimPrefix(r.URL.Path, "/lifecycle/")
+	bucket := path
+
+	switch r.Method {
+	case http.MethodPut:
+		// Put lifecycle policy
+		var policy types.LifecyclePolicy
+		if err := json.NewDecoder(r.Body).Decode(&policy); err != nil {
+			http.Error(w, "invalid policy data", http.StatusBadRequest)
+			return
+		}
+
+		policy.Bucket = bucket
+		if err := s.db.PutLifecyclePolicy(bucket, &policy); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+
+	case http.MethodGet:
+		// Get lifecycle policy
+		policy, err := s.db.GetLifecyclePolicy(bucket)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(policy)
+
+	case http.MethodDelete:
+		// Delete lifecycle policy
+		if err := s.db.DeleteLifecyclePolicy(bucket); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		w.WriteHeader(http.StatusNoContent)
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 const uiHTML = `

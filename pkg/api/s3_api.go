@@ -34,13 +34,21 @@ type BucketEntry struct {
 
 // ListBucketResult (GET Bucket)
 type ListBucketResult struct {
-	XMLName     xml.Name      `xml:"ListBucketResult"`
-	Name        string        `xml:"Name"`
-	Prefix      string        `xml:"Prefix"`
-	Marker      string        `xml:"Marker"`
-	MaxKeys     int           `xml:"MaxKeys"`
-	IsTruncated bool          `xml:"IsTruncated"`
-	Contents    []ObjectEntry `xml:"Contents"`
+	XMLName        xml.Name       `xml:"ListBucketResult"`
+	Name           string         `xml:"Name"`
+	Prefix         string         `xml:"Prefix,omitempty"`
+	Marker         string         `xml:"Marker,omitempty"`
+	MaxKeys        int            `xml:"MaxKeys"`
+	Delimiter      string         `xml:"Delimiter,omitempty"`
+	IsTruncated    bool           `xml:"IsTruncated"`
+	NextMarker     string         `xml:"NextMarker,omitempty"`
+	Contents       []ObjectEntry  `xml:"Contents"`
+	CommonPrefixes []CommonPrefix `xml:"CommonPrefixes,omitempty"`
+}
+
+type CommonPrefix struct {
+	XMLName xml.Name `xml:"CommonPrefixes"`
+	Prefix  string   `xml:"Prefix"`
 }
 
 type ObjectEntry struct {

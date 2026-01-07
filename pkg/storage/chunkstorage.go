@@ -63,6 +63,59 @@ func (cs *ChunkStorage) WriteChunk(chunkID string, data []byte) (string, error) 
 	return chunkPath, nil
 }
 
+// WriteChunkFromReader writes a chunk from an io.Reader (streaming)
+func (cs *ChunkStorage) WriteChunkFromReader(chunkID string, reader io.Reader, expectedSize int64) (string, error) {
+	// Create hierarchical path: /base/ab/cd/abcd1234...
+	subdir := cs.getSubdirectory(chunkID)
+	fullDir := filepath.Join(cs.basePath, subdir)
+
+	if err := os.MkdirAll(fullDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create chunk directory: %w", err)
+	}
+
+	// Full path to chunk file
+	chunkPath := filepath.Join(fullDir, chunkID)
+	tmpPath := chunkPath + ".tmp"
+
+	// Create temporary file
+	tmpFile, err := os.Create(tmpPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer tmpFile.Close()
+
+	// Stream data from reader to file
+	written, err := io.Copy(tmpFile, reader)
+	if err != nil {
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("failed to write chunk data: %w", err)
+	}
+
+	// Verify size if expectedSize > 0
+	if expectedSize > 0 && written != expectedSize {
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("size mismatch: expected %d, got %d", expectedSize, written)
+	}
+
+	// Close file before rename
+	tmpFile.Close()
+
+	// Atomic rename
+	if err := os.Rename(tmpPath, chunkPath); err != nil {
+		os.Remove(tmpPath)
+		return "", fmt.Errorf("failed to finalize chunk: %w", err)
+	}
+
+	// Sync directory to ensure metadata is persisted
+	dir, err := os.Open(fullDir)
+	if err == nil {
+		dir.Sync()
+		dir.Close()
+	}
+
+	return chunkPath, nil
+}
+
 // ReadChunk reads a chunk from filesystem
 func (cs *ChunkStorage) ReadChunk(chunkID string) ([]byte, error) {
 	chunkPath := cs.getChunkPath(chunkID)
