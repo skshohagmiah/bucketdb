@@ -5,8 +5,12 @@
 
 echo "🚀 Starting BucketDB Cluster..."
 
+# Ensure we are in the project root
+cd "$(dirname "$0")/.." || exit
+
 # Create base data directory
 mkdir -p data
+mkdir -p logs
 
 # Cleanup previous data if any (optional)
 # rm -rf data/*

@@ -3,6 +3,10 @@
 # End-to-End Feature Test for BucketDB Cluster
 
 echo "🧪 Starting End-to-End Feature Tests..."
+
+# Ensure we are in the project root
+cd "$(dirname "$0")/.." || exit
+
 echo "🧹 Cleaning up previous processes..."
 fuser -k 9080/tcp 9081/tcp 9082/tcp 8080/tcp 8081/tcp 8082/tcp > /dev/null 2>&1
 sleep 2 # Wait for sockets to close
