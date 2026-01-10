@@ -61,6 +61,19 @@ type TLSConfig struct {
 	InsecureSkipVerify bool   // For dev mode
 }
 
+// AuthConfig holds authentication credentials
+type AuthConfig struct {
+	AccessKey string
+	SecretKey string
+}
+
+// ErasureCodingConfig holds EC settings
+type ErasureCodingConfig struct {
+	Enabled      bool
+	DataShards   int
+	ParityShards int
+}
+
 // StorageStats represents storage statistics
 type StorageStats struct {
 	TotalObjects    int64   `json:"total_objects"`
@@ -85,6 +98,12 @@ type Config struct {
 
 	// TLS configuration
 	TLS TLSConfig
+
+	// Auth configuration
+	Auth AuthConfig
+
+	// Erasure Coding configuration
+	ErasureCoding ErasureCodingConfig
 
 	// Standalone mode (single node, no cluster coordination)
 	Standalone bool
@@ -112,6 +131,15 @@ func DefaultConfig() *Config {
 		},
 		TLS: TLSConfig{
 			Enabled: false,
+		},
+		Auth: AuthConfig{
+			AccessKey: "admin",
+			SecretKey: "password123",
+		},
+		ErasureCoding: ErasureCodingConfig{
+			Enabled:      true,
+			DataShards:   2,
+			ParityShards: 1, // 2+1 for 3 nodes
 		},
 	}
 }

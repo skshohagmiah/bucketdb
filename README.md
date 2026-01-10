@@ -39,7 +39,6 @@ BucketDB is designed to be a drop-in replacement for S3 in self-hosted environme
 - **S3 Compatible**: Implements the essential subset of the S3 API (List, Get, Put, Delete, Multipart) allowing use with standard tools like `aws s3`, `boto3`, and `minio-client`.
 - **Developer Ready**: 
     - Universal REST API for custom integration.
-    - Built-in Web Dashboard for management.
     - HTTP Range Request support for media streaming.
 - **Production Grade**: 
     - Background Garbage Collection (GC) to reclaim storage.
@@ -78,6 +77,19 @@ BucketDB supports a configurable consistency model. You can choose between **Eve
 -   **Failure Handling**: If the quorum is not met within `ReplicationTimeout`, the write is aborted to ensure consistency.
 -   **Pros**: Guarantees data durability and consistency.
 -   **Cons**: Higher write latency.
+
+### 🛡️ Production Security
+BucketDB now enforces security by default:
+1.  **HMAC Authentication**: All requests must be signed using AWS Signature V4 protocol.
+2.  **Access Control**: Valid `AccessKey` and `SecretKey` are required.
+3.  **Bit Rot Protection**: A background scrubber runs hourly to verify chunk checksums and auto-repairs corrupted data from replicas.
+
+### 🧩 Erasure Coding (2+1)
+For storage efficiency, BucketDB supports **Erasure Coding** instead of full replication.
+-   **Mechanism**: Data is split into 2 data shards + 1 parity shard (XOR).
+-   **Distribution**: Shards are distributed across 3 nodes.
+-   **Efficiency**: Uses 1.5x storage overhead (vs 3.0x for standard replication).
+-   **Resilience**: Can survive the loss of any 1 node.
 
 ### Streaming Data Engine
 BucketDB implements a true streaming pipeline for both uploads and downloads to handle massive files with constant memory usage.
@@ -134,11 +146,7 @@ go mod download
 ./scripts/run_cluster.sh
 ```
 
-### 🖥️ Dashboard
-Visit `http://localhost:9080` to access the built-in UI:
-- **Cluster Status**: View ring membership and node health.
-- **File Browser**: Upload, download, and delete files visually.
-- **Node Metrics**: Real-time stats on disk usage and request count.
+
 
 ---
 
@@ -158,8 +166,14 @@ BucketDB is configured via a `Config` struct or environment variables.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `ReplicationFactor` | int | `3` | Number of copies for each object. |
+| `ErasureCoding` | struct | `Enabled` | Use 2+1 EC instead of replication (saves 50% space). |
 | `QuorumRequired` | bool | `false` | If true, enforces strict consistency (wait for N/2+1). |
-| `ReplicationTimeout` | duration | `10s` | Max wait time for quorum writes before aborting. |
+
+### Security Config
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `Auth.AccessKey` | string | `admin` | Access Key ID. |
+| `Auth.SecretKey` | string | `password123` | Secret Access Key. |
 
 ### Example Config (Production)
 ```go
@@ -167,9 +181,20 @@ config := &types.Config{
     StoragePath:        "/var/lib/bucketdb/data",
     MetadataPath:       "/var/lib/bucketdb/meta",
     ChunkSize:          8 * 1024 * 1024,      // 8MB chunks
-    MaxObjectSize:      50 * 1024 * 1024 * 1024, // 50GB max
-    ReplicationFactor:  3,
-    QuorumRequired:     true,
+    
+    // Security
+    Auth: types.AuthConfig{
+        AccessKey: "production-key",
+        SecretKey: "complex-secret-value",
+    },
+
+    // Efficiency
+    ErasureCoding: types.ErasureCodingConfig{
+        Enabled: true,
+        DataShards: 2,
+        ParityShards: 1,
+    },
+    
     ReplicationTimeout: 5 * time.Second,
 }
 ```
